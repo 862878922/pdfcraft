@@ -52,7 +52,7 @@ jobs:
           sudo cp binaryen-version_122/bin/* /usr/local/bin/
           wasm-opt --version
 
-      # 6. 配置体积压缩、查找所有 index.html 注入默认中文
+      # 6. 配置体积压缩、关闭 Trunk 老旧 wasm-opt 并注入默认中文
       - name: Optimize Profile and Set Chinese Default
         run: |
           # 禁用所有可能的 Trunk 内置 wasm-opt 配置
@@ -118,74 +118,64 @@ jobs:
                       except Exception:
                           pass
 
-          # 3. 为所有检索到的 index.html 注入默认中文 localStorage
-          for root, _, files in os.walk("."):
-              for file in files:
-                  if file == "index.html" and "dist" not in root and "target" not in root:
-                      path = os.path.join(root, file)
-                      with open(path, "r", encoding="utf-8") as f:
-                          html = f.read()
-                      script = (
-                          "<script>\n"
-                          "try {\n"
-                          "  if (!localStorage.getItem('pdfcraft_language') && !localStorage.getItem('language')) {\n"
-                          "    localStorage.setItem('pdfcraft_language', 'zh');\n"
-                          "    localStorage.setItem('language', 'zh');\n"
-                          "    localStorage.setItem('locale', 'zh');\n"
-                          "  }\n"
-                          "} catch(e) {}\n"
-                          "</script>\n"
-                      )
-                      if "<head>" in html and "pdfcraft_language" not in html:
-                          html = html.replace("<head>", "<head>\n" + script)
-                          with open(path, "w", encoding="utf-8") as f:
-                              f.write(html)
-                          print(f"✅ 已在 {path} 注入中文初始化脚本")
+          # 3. 为 apps/pdfcraft-web/index.html 注入默认中文 localStorage
+          target_html = "apps/pdfcraft-web/index.html"
+          if os.path.exists(target_html):
+              with open(target_html, "r", encoding="utf-8") as f:
+                  html = f.read()
+              script = (
+                  "<script>\n"
+                  "try {\n"
+                  "  if (!localStorage.getItem('pdfcraft_language') && !localStorage.getItem('language')) {\n"
+                  "    localStorage.setItem('pdfcraft_language', 'zh');\n"
+                  "    localStorage.setItem('language', 'zh');\n"
+                  "    localStorage.setItem('locale', 'zh');\n"
+                  "  }\n"
+                  "} catch(e) {}\n"
+                  "</script>\n"
+              )
+              if "<head>" in html and "pdfcraft_language" not in html:
+                  html = html.replace("<head>", "<head>\n" + script)
+                  with open(target_html, "w", encoding="utf-8") as f:
+                      f.write(html)
+                  print("✅ apps/pdfcraft-web/index.html 注入中文初始化脚本成功")
           PYEOF
 
           python3 patch_all.py
           rm -f patch_all.py
 
-      # 7. 动态定位 index.html 真实路径并构建 WebAssembly 产物
+      # 7. 预建产物目录并在根目录执行构建
       - name: Build Web Application
         env:
           CARGO_BUILD_JOBS: 2
         run: |
-          echo "=== 正在全局搜索 index.html ==="
-          HTML_PATH=$(find . -maxdepth 4 -name "index.html" ! -path "*/target/*" ! -path "*/dist/*" | head -n 1)
+          # 预先在根目录建立 dist 与 dist/web 目录，消除路径创建失败错误
+          mkdir -p dist/web
           
-          if [ -z "$HTML_PATH" ]; then
-            echo "❌ 未能找到 index.html，输出当前目录结构："
-            ls -la
-            exit 1
-          fi
-
-          echo "✅ 找到有效入口 HTML 文件: $HTML_PATH"
-          HTML_DIR=$(dirname "$HTML_PATH")
+          # 在根目录下直接调用 apps/pdfcraft-web/index.html 构建
+          trunk build apps/pdfcraft-web/index.html --release
           
-          # 进入包含 index.html 的目录进行编译构建
-          cd "$HTML_DIR"
-          trunk build index.html --release
-          cd -
-
-          # 收集产物到根目录 dist/
-          if [ ! -d "dist" ]; then
-            PROD_DIST=$(find . -maxdepth 4 -type d -name "dist" ! -path "*/target/*" | head -n 1)
-            if [ -n "$PROD_DIST" ] && [ "$PROD_DIST" != "./dist" ]; then
-              cp -r "$PROD_DIST" ./dist
+          # 产物规范检查：确保 dist/web 包含 index.html 和 wasm
+          if [ ! -f "dist/web/index.html" ] && [ -d "dist" ]; then
+            SUB_INDEX=$(find dist -name "index.html" | head -n 1)
+            if [ -n "$SUB_INDEX" ]; then
+              SUB_DIR=$(dirname "$SUB_INDEX")
+              if [ "$SUB_DIR" != "dist/web" ]; then
+                cp -r "$SUB_DIR"/* dist/web/ || true
+              fi
             fi
           fi
 
-          echo "=== 检查最终构建产物 ==="
-          ls -lh dist/
+          echo "=== 检查初步构建产物 ==="
+          ls -lh dist/web/
 
       # 8. 深度压缩 wasm 并执行 24MB 自动切片防御
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
-          WASM_FILE=$(ls dist/*_bg.wasm 2>/dev/null | head -n 1 || ls dist/*.wasm 2>/dev/null | head -n 1)
+          WASM_FILE=$(ls dist/web/*_bg.wasm 2>/dev/null | head -n 1 || ls dist/web/*.wasm 2>/dev/null | head -n 1 || ls dist/*.wasm 2>/dev/null | head -n 1)
           if [ -z "$WASM_FILE" ]; then
             echo "❌ 未检测到编译出的 wasm 文件，检查 dist 目录内容："
-            ls -lh dist/
+            ls -R dist/
             exit 1
           fi
 
@@ -196,12 +186,15 @@ jobs:
           cat << 'PYEOF' > split_wasm.py
           import os, glob, re
 
-          wasm_files = glob.glob("dist/*.wasm")
+          wasm_files = glob.glob("dist/web/*.wasm")
+          if not wasm_files:
+              wasm_files = glob.glob("dist/*.wasm")
           if not wasm_files:
               print("No wasm found")
               exit(0)
 
           wasm_path = wasm_files[0]
+          wasm_dir = os.path.dirname(wasm_path)
           size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
           print(f"Current wasm size: {size_mb:.2f} MB")
 
@@ -215,7 +208,7 @@ jobs:
               chunks = []
               for i in range(0, len(data), chunk_size):
                   part_name = f"{wasm_filename}.part{len(chunks)}"
-                  part_path = os.path.join("dist", part_name)
+                  part_path = os.path.join(wasm_dir, part_name)
                   with open(part_path, "wb") as pf:
                       pf.write(data[i:i+chunk_size])
                   chunks.append(f"./{part_name}")
@@ -223,7 +216,7 @@ jobs:
 
               os.remove(wasm_path)
 
-              html_path = "dist/index.html"
+              html_path = os.path.join(wasm_dir, "index.html")
               with open(html_path, "r", encoding="utf-8") as f:
                   html = f.read()
 
@@ -252,7 +245,7 @@ jobs:
 
               with open(html_path, "w", encoding="utf-8") as f:
                   f.write(html)
-              print("Updated dist/index.html with chunk loader.")
+              print(f"Updated {html_path} with chunk loader.")
           else:
               print("Wasm file size within safe limit (<= 24MB).")
           PYEOF
@@ -261,12 +254,12 @@ jobs:
           rm -f split_wasm.py
 
           echo "=== 最终提交部署的文件列表 ==="
-          ls -lh dist/
+          ls -lh dist/web/
 
-      # 9. 部署发布到 Cloudflare Pages
+      # 9. 部署发布到 Cloudflare Pages (lotelf-pdf)
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist --project-name=lotelf-pdf --branch=main --commit-dirty=true
+          command: pages deploy dist/web --project-name=lotelf-pdf --branch=main --commit-dirty=true
