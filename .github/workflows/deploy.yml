@@ -1,0 +1,269 @@
+name: Deploy PdfCraft to Cloudflare Pages
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 1. 扩容 10GB 虚拟内存，避免 OOM 闪退 (Exit code 143)
+      - name: Expand Swap Space (Fix OOM Exit Code 143)
+        run: |
+          echo "=== 扩容前内存状况 ==="
+          free -h
+          sudo swapoff -a || true
+          sudo fallocate -l 10G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=10240
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "=== 扩容后内存状况 ==="
+          free -h
+
+      # 2. 安装 Rust 工具链与 Wasm 目标平台
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # 3. Rust 依赖与编译缓存加速
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # 4. 安装 Trunk 打包工具
+      - name: Install Trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+
+      # 5. 安装现代 Binaryen (wasm-opt v122)
+      - name: Install Modern Binaryen (wasm-opt v122)
+        run: |
+          curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
+          sudo cp binaryen-version_122/bin/* /usr/local/bin/
+          wasm-opt --version
+
+      # 6. 配置体积压缩、关闭 Trunk 老旧 wasm-opt，并自动注入默认中文设置
+      - name: Optimize Profile and Set Chinese Default
+        run: |
+          # 禁用 Trunk 内置 wasm-opt 避免构建报错
+          if [ -f "Trunk.toml" ]; then
+            sed -i 's/wasm_opt = true/wasm_opt = false/g' Trunk.toml || true
+            sed -i 's/wasm_opt = "z"/wasm_opt = false/g' Trunk.toml || true
+          fi
+          if [ -f "index.html" ]; then
+            sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' index.html || true
+          fi
+
+          # 1. 配置 Cargo.toml 最小体积 profile
+          python3 - <<'EOF'
+          import re, os
+          cargo_file = "Cargo.toml"
+          if os.path.exists(cargo_file):
+              with open(cargo_file, "r", encoding="utf-8") as f:
+                  content = f.read()
+              
+              opt_profile = """
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = true
+debug = 0
+"""
+              if "[profile.release]" in content:
+                  content = re.sub(r'\[profile\.release\][^\[]*', opt_profile.strip() + "\n\n", content)
+              else:
+                  content += "\n" + opt_profile
+                  
+              with open(cargo_file, "w", encoding="utf-8") as f:
+                  f.write(content)
+              print("✅ Cargo.toml 已更新为轻量 release 配置")
+          EOF
+
+          # 2. 扫描并自动将默认语言修改为中文 (zh / zh-CN / Chinese / ZhHans)
+          python3 - <<'EOF'
+          import os, re
+
+          # 遍历所有 Rust 源码文件寻找默认语言设置并替换
+          modified = False
+          for root, _, files in os.walk("crates"):
+              for file in files:
+                  if file.endswith(".rs"):
+                      path = os.path.join(root, file)
+                      try:
+                          with open(path, "r", encoding="utf-8") as f:
+                              code = f.read()
+                          
+                          new_code = code
+                          # 匹配枚举默认语言（如 Default for Language 或 default_language）
+                          if "Language::English" in new_code:
+                              # 判断是否存在 Chinese / Zh / ZhHans 枚举项
+                              if "Language::Chinese" in code:
+                                  new_code = new_code.replace("Language::English", "Language::Chinese")
+                              elif "Language::Zh" in code:
+                                  new_code = new_code.replace("Language::English", "Language::Zh")
+                              elif "Language::ZhHans" in code:
+                                  new_code = new_code.replace("Language::English", "Language::ZhHans")
+                              elif "Language::SimplifiedChinese" in code:
+                                  new_code = new_code.replace("Language::English", "Language::SimplifiedChinese")
+
+                          # 匹配常见的语言字符串默认值
+                          new_code = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', new_code)
+                          new_code = re.sub(r'default_lang\s*=\s*"en"', 'default_lang = "zh"', new_code)
+
+                          if new_code != code:
+                              with open(path, "w", encoding="utf-8") as f:
+                                  f.write(new_code)
+                              print(f"✅ 已在 {path} 中将默认语言切换为中文")
+                              modified = True
+                      except Exception as e:
+                          pass
+
+          if not modified:
+              print("ℹ️ 源码中未检测到显式枚举声明，尝试检查前端 localstorage / html lang 注入")
+
+          # 在 index.html 中注入默认语言 localStorage 标记，强制前端载入时直接以中文初始化
+          if os.path.exists("index.html"):
+              with open("index.html", "r", encoding="utf-8") as f:
+                  html = f.read()
+              
+              # 注入 localStorage 强制锁定中文，解决首次载入时的语言判定
+              lang_script = """
+              <script>
+                try {
+                  if (!localStorage.getItem('pdfcraft_language') && !localStorage.getItem('language')) {
+                    localStorage.setItem('pdfcraft_language', 'zh');
+                    localStorage.setItem('language', 'zh');
+                    localStorage.setItem('locale', 'zh');
+                  }
+                } catch(e) {}
+              </script>
+              """
+              if "<head>" in html and "pdfcraft_language" not in html:
+                  html = html.replace("<head>", "<head>" + lang_script)
+                  with open("index.html", "w", encoding="utf-8") as f:
+                      f.write(html)
+                  print("✅ index.html 已注入浏览器层面的默认中文初始化脚本")
+          EOF
+
+      # 7. 构建 WebAssembly 产物（限制并行线程数，防止内存超载）
+      - name: Build Web Application
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: |
+          trunk build --release
+          echo "=== 查看初始构建产物 ==="
+          ls -lh dist/
+
+      # 8. 深度压缩 wasm 并执行 24MB 自动切片防御
+      - name: Compress Wasm & Handle 25MB Cloudflare Limit
+        run: |
+          WASM_FILE=$(ls dist/*_bg.wasm 2>/dev/null | head -n 1 || ls dist/*.wasm 2>/dev/null | head -n 1)
+          if [ -z "$WASM_FILE" ]; then
+            echo "❌ 未检测到编译出的 wasm 文件，检查 dist 目录内容："
+            ls -lh dist/
+            exit 1
+          fi
+
+          echo "压缩前大小: $(ls -lh "$WASM_FILE" | awk '{print $5}')"
+          wasm-opt --all-features -Oz --strip-debug --strip-producers "$WASM_FILE" -o "$WASM_FILE" || true
+          echo "压缩后大小: $(ls -lh "$WASM_FILE" | awk '{print $5}')"
+
+          # 校验是否超过 Cloudflare Pages 25MB 限制，若超出自动按 15MB 拆分
+          python3 - <<'EOF'
+          import os, glob, re
+
+          wasm_files = glob.glob("dist/*.wasm")
+          if not wasm_files:
+              print("未在 dist 目录下找到 wasm 目标文件")
+              exit(0)
+
+          wasm_path = safe_wasm = wasm_files[0]
+          size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
+          print(f"当前 wasm 实际体积: {size_mb:.2f} MB")
+
+          if size_mb > 24.0:
+              print("⚠️ Wasm 体积大于 24MB，启动自动无缝分片机制...")
+              wasm_filename = os.path.basename(wasm_path)
+              chunk_size = 15 * 1024 * 1024
+              
+              with open(wasm_path, "rb") as f:
+                  data = f.read()
+
+              chunks = []
+              for i in range(0, len(data), chunk_size):
+                  part_name = f"{wasm_filename}.part{len(chunks)}"
+                  part_path = os.path.join("dist", part_name)
+                  with open(part_path, "wb") as pf:
+                      pf.write(data[i:i+chunk_size])
+                  chunks.append(f"./{part_name}")
+                  print(f"  已生成分片: {part_name} ({len(data[i:i+chunk_size]) / (1024*1024):.2f} MB)")
+
+              os.remove(wasm_path)
+
+              html_path = "dist/index.html"
+              with open(html_path, "r", encoding="utf-8") as f:
+                  html = f.read()
+
+              chunk_urls_js = str(chunks)
+              loader_js = f"""
+              async function __loadWasmChunks() {{
+                const parts = {chunk_urls_js};
+                const buffers = await Promise.all(parts.map(p => fetch(p).then(r => {{
+                  if (!r.ok) throw new Error("加载分片失败: " + p);
+                  return r.arrayBuffer();
+                }})));
+                const total = buffers.reduce((acc, b) => acc + b.byteLength, 0);
+                const out = new Uint8Array(total);
+                let offset = 0;
+                for (const b of buffers) {{
+                  out.set(new Uint8Array(b), offset);
+                  offset += b.byteLength;
+                }}
+                return out;
+              }}
+              const wasm = await init({{ module_or_path: await __loadWasmChunks() }});
+              """
+
+              # 替换 trunk 注入的初始化逻辑并移除全量预加载头
+              html = re.sub(r'const wasm = await init\(\{[^}]+\}\);', loader_js.strip(), html)
+              html = re.sub(r'<link rel="preload" [^>]*\.wasm[^>]*>', '', html)
+
+              with open(html_path, "w", encoding="utf-8") as f:
+                  f.write(html)
+              print("✅ dist/index.html 已替换为多分片并发组装加载器")
+          else:
+              print("✅ wasm 体积已在安全线内 (<= 24MB)，无需拆分")
+          EOF
+
+          echo "=== 最终提交部署的文件列表 ==="
+          ls -lh dist/
+
+      # 9. 部署发布到 Cloudflare Pages (lotelf-pdf)
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # 自动获取 Account ID
+          ACCOUNTS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          DETECTED_ID=$(echo "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
+
+          if [ -n "$DETECTED_ID" ] && [ "$DETECTED_ID" != "null" ]; then
+            export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
+          fi
+
+          npm install -g wrangler
+          wrangler pages deploy dist --project-name=lotelf-pdf --branch=main --commit-dirty=true
