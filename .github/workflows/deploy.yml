@@ -45,17 +45,27 @@ jobs:
         with:
           tool: trunk@0.20.3
 
-      # 5. 安装现代 Binaryen (wasm-opt v122)
-      - name: Install Modern Binaryen (wasm-opt v122)
+      # 5. 安装现代 Binaryen (wasm-opt v122) 并创建自动注入 SIMD 支持的 Wrapper
+      - name: Install Modern Binaryen & Setup SIMD Wrapper
         run: |
           curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
           sudo cp binaryen-version_122/bin/* /usr/local/bin/
+          
+          # 将原始 wasm-opt 重命名为 wasm-opt-raw
+          sudo mv /usr/local/bin/wasm-opt /usr/local/bin/wasm-opt-raw
+          
+          # 创建智能 Wrapper 脚本：强制注入 --enable-simd 和 --all-features 避免验证器报错
+          sudo bash -c 'cat << "EOF" > /usr/local/bin/wasm-opt
+#!/bin/bash
+exec /usr/local/bin/wasm-opt-raw --all-features --enable-simd "$@"
+EOF'
+          sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 配置体积压缩、关闭 Trunk 老旧 wasm-opt 并注入默认中文
+      # 6. 配置体积压缩并注入默认中文
       - name: Optimize Profile and Set Chinese Default
         run: |
-          # 禁用所有可能的 Trunk 内置 wasm-opt 配置
+          # 禁用所有可能的 Trunk 内置冲突配置
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
           find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
@@ -149,13 +159,12 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 2
         run: |
-          # 预先在根目录建立 dist 与 dist/web 目录，消除路径创建失败错误
           mkdir -p dist/web
           
-          # 在根目录下直接调用 apps/pdfcraft-web/index.html 构建
+          # 直接在根目录下调用 apps/pdfcraft-web/index.html 构建
           trunk build apps/pdfcraft-web/index.html --release
           
-          # 产物规范检查：确保 dist/web 包含 index.html 和 wasm
+          # 产物规范检查：确保 dist/web 包含构建结果
           if [ ! -f "dist/web/index.html" ] && [ -d "dist" ]; then
             SUB_INDEX=$(find dist -name "index.html" | head -n 1)
             if [ -n "$SUB_INDEX" ]; then
@@ -169,85 +178,87 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并执行 24MB 自动切片防御
+      # 8. 深度压缩 wasm 并执行 24MB 自动切片防御（兼容处理所有 wasm，包括 worker）
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
-          WASM_FILE=$(ls dist/web/*_bg.wasm 2>/dev/null | head -n 1 || ls dist/web/*.wasm 2>/dev/null | head -n 1 || ls dist/*.wasm 2>/dev/null | head -n 1)
-          if [ -z "$WASM_FILE" ]; then
-            echo "❌ 未检测到编译出的 wasm 文件，检查 dist 目录内容："
-            ls -R dist/
-            exit 1
-          fi
-
-          echo "压缩前大小: $(ls -lh "$WASM_FILE" | awk '{print $5}')"
-          wasm-opt --all-features -Oz --strip-debug --strip-producers "$WASM_FILE" -o "$WASM_FILE" || true
-          echo "压缩后大小: $(ls -lh "$WASM_FILE" | awk '{print $5}')"
-
+          echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
           cat << 'PYEOF' > split_wasm.py
-          import os, glob, re
+          import os, glob, re, subprocess
 
-          wasm_files = glob.glob("dist/web/*.wasm")
+          # 寻找 dist/web 及其子目录下所有的 wasm 文件
+          wasm_files = glob.glob("dist/web/**/*.wasm", recursive=True)
           if not wasm_files:
-              wasm_files = glob.glob("dist/*.wasm")
+              wasm_files = glob.glob("dist/**/*.wasm", recursive=True)
+          
           if not wasm_files:
-              print("No wasm found")
-              exit(0)
+              print("❌ 未在 dist 目录下找到 wasm 目标文件")
+              exit(1)
 
-          wasm_path = wasm_files[0]
-          wasm_dir = os.path.dirname(wasm_path)
-          size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
-          print(f"Current wasm size: {size_mb:.2f} MB")
-
-          if size_mb > 24.0:
-              print("Wasm size exceeds 24MB, splitting chunks...")
+          for wasm_path in wasm_files:
+              wasm_dir = os.path.dirname(wasm_path)
               wasm_filename = os.path.basename(wasm_path)
-              chunk_size = 15 * 1024 * 1024
-              with open(wasm_path, "rb") as f:
-                  data = f.read()
+              print(f"\n--- 处理: {wasm_filename} ---")
+              
+              # 1. 深度优化瘦身（带 --all-features 支持 SIMD）
+              cmd = ["/usr/local/bin/wasm-opt-raw", "--all-features", "-Oz", "--strip-debug", "--strip-producers", wasm_path, "-o", wasm_path]
+              try:
+                  subprocess.run(cmd, check=True)
+                  print(f"优化完成: {os.path.getsize(wasm_path)/(1024*1024):.2f} MB")
+              except Exception as e:
+                  print(f"wasm-opt 优化跳过: {e}")
 
-              chunks = []
-              for i in range(0, len(data), chunk_size):
-                  part_name = f"{wasm_filename}.part{len(chunks)}"
-                  part_path = os.path.join(wasm_dir, part_name)
-                  with open(part_path, "wb") as pf:
-                      pf.write(data[i:i+chunk_size])
-                  chunks.append(f"./{part_name}")
-                  print(f"Generated part: {part_name}")
+              # 2. 检查是否越过 Cloudflare 25MB 上限 (主页面 bg.wasm 才会触发 index.html 切片)
+              size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
+              if size_mb > 24.0 and "_bg.wasm" in wasm_filename:
+                  print(f"⚠️ {wasm_filename} 体积大于 24MB ({size_mb:.2f} MB)，启动自动分片机制...")
+                  chunk_size = 15 * 1024 * 1024
+                  with open(wasm_path, "rb") as f:
+                      data = f.read()
 
-              os.remove(wasm_path)
+                  chunks = []
+                  for i in range(0, len(data), chunk_size):
+                      part_name = f"{wasm_filename}.part{len(chunks)}"
+                      part_path = os.path.join(wasm_dir, part_name)
+                      with open(part_path, "wb") as pf:
+                          pf.write(data[i:i+chunk_size])
+                      chunks.append(f"./{part_name}")
+                      print(f"  已生成分片: {part_name}")
 
-              html_path = os.path.join(wasm_dir, "index.html")
-              with open(html_path, "r", encoding="utf-8") as f:
-                  html = f.read()
+                  os.remove(wasm_path)
 
-              chunk_urls_js = str(chunks)
-              loader_js = (
-                  "async function __loadWasmChunks() {\n"
-                  f"  const parts = {chunk_urls_js};\n"
-                  "  const buffers = await Promise.all(parts.map(p => fetch(p).then(r => {\n"
-                  "    if (!r.ok) throw new Error('Chunk load failed: ' + p);\n"
-                  "    return r.arrayBuffer();\n"
-                  "  })));\n"
-                  "  const total = buffers.reduce((acc, b) => acc + b.byteLength, 0);\n"
-                  "  const out = new Uint8Array(total);\n"
-                  "  let offset = 0;\n"
-                  "  for (const b of buffers) {\n"
-                  "    out.set(new Uint8Array(b), offset);\n"
-                  "    offset += b.byteLength;\n"
-                  "  }\n"
-                  "  return out;\n"
-                  "}\n"
-                  "const wasm = await init({ module_or_path: await __loadWasmChunks() });"
-              )
+                  html_path = os.path.join(wasm_dir, "index.html")
+                  if os.path.exists(html_path):
+                      with open(html_path, "r", encoding="utf-8") as f:
+                          html = f.read()
 
-              html = re.sub(r'const wasm = await init\(\{[^}]+\}\);', loader_js, html)
-              html = re.sub(r'<link rel="preload" [^>]*\.wasm[^>]*>', '', html)
+                      chunk_urls_js = str(chunks)
+                      loader_js = (
+                          "async function __loadWasmChunks() {\n"
+                          f"  const parts = {chunk_urls_js};\n"
+                          "  const buffers = await Promise.all(parts.map(p => fetch(p).then(r => {\n"
+                          "    if (!r.ok) throw new Error('Chunk load failed: ' + p);\n"
+                          "    return r.arrayBuffer();\n"
+                          "  })));\n"
+                          "  const total = buffers.reduce((acc, b) => acc + b.byteLength, 0);\n"
+                          "  const out = new Uint8Array(total);\n"
+                          "  let offset = 0;\n"
+                          "  for (const b of buffers) {\n"
+                          "    out.set(new Uint8Array(b), offset);\n"
+                          "    offset += b.byteLength;\n"
+                          "  }\n"
+                          "  return out;\n"
+                          "}\n"
+                          "const wasm = await init({ module_or_path: await __loadWasmChunks() });"
+                      )
 
-              with open(html_path, "w", encoding="utf-8") as f:
-                  f.write(html)
-              print(f"Updated {html_path} with chunk loader.")
-          else:
-              print("Wasm file size within safe limit (<= 24MB).")
+                      html = re.sub(r'const wasm = await init\(\{[^}]+\}\);', loader_js, html)
+                      html = re.sub(r'<link rel="preload" [^>]*\.wasm[^>]*>', '', html)
+
+                      with open(html_path, "w", encoding="utf-8") as f:
+                          f.write(html)
+                      print(f"✅ {html_path} 已更新为分片加载器")
+              else:
+                  print(f"✅ {wasm_filename} 体积安全 (<= 24MB)")
           PYEOF
 
           python3 split_wasm.py
