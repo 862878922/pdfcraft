@@ -45,7 +45,7 @@ jobs:
         with:
           tool: trunk@0.20.3
 
-      # 5. 安装现代 Binaryen (wasm-opt v122) 并创建 SIMD Wrapper (纯单行安全写入，彻底避开 YAML 语法冲突)
+      # 5. 安装现代 Binaryen (wasm-opt v122) 并创建 SIMD Wrapper
       - name: Install Modern Binaryen & Setup SIMD Wrapper
         run: |
           curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
@@ -100,7 +100,7 @@ jobs:
 
               with open(cargo_file, "w", encoding="utf-8") as f:
                   f.writelines(filtered)
-              print("Cargo.toml release profile safe updated.")
+              print("Cargo.toml release profile safely updated.")
 
           # 2. 扫描源码并将默认语言修改为中文
           for root, _, files in os.walk("crates"):
@@ -151,31 +151,43 @@ jobs:
           python3 patch_all.py
           rm -f patch_all.py
 
-      # 7. 预建产物目录并在根目录执行构建
+      # 7. 执行构建并自动收集产物到 dist/web
       - name: Build Web Application
         env:
           CARGO_BUILD_JOBS: 2
         run: |
           mkdir -p dist/web
           
-          # 直接在根目录下调用 apps/pdfcraft-web/index.html 构建
+          # 执行编译构建
           trunk build apps/pdfcraft-web/index.html --release
           
-          # 产物规范检查：确保 dist/web 包含构建结果
-          if [ ! -f "dist/web/index.html" ] && [ -d "dist" ]; then
-            SUB_INDEX=$(find dist -name "index.html" | head -n 1)
-            if [ -n "$SUB_INDEX" ]; then
-              SUB_DIR=$(dirname "$SUB_INDEX")
-              if [ "$SUB_DIR" != "dist/web" ]; then
-                cp -r "$SUB_DIR"/* dist/web/ || true
-              fi
-            fi
-          fi
+          # 自动全局检索真实产物位置并完整同步到 dist/web/
+          python3 - << 'EOF'
+          import os, shutil, glob
 
-          echo "=== 检查初步构建产物 ==="
+          # 查找所有生成的 .wasm 文件位置（排除 target 构建缓存）
+          all_wasm = [p for p in glob.glob("**/*.wasm", recursive=True) if "target" not in p and "dist/web" not in p]
+          print("发现编译产物路径:", all_wasm)
+          
+          if all_wasm:
+              source_dir = os.path.dirname(all_wasm[0])
+              print(f"定位到实际产物目录: {source_dir}，正在归拢到 dist/web/ ...")
+              for item in os.listdir(source_dir):
+                  src = os.path.join(source_dir, item)
+                  dst = os.path.join("dist/web", item)
+                  if os.path.isdir(src):
+                      shutil.copytree(src, dst, dirs_exist_ok=True)
+                  else:
+                      shutil.copy2(src, dst)
+              print("✅ 产物已成功归拢到 dist/web/")
+          else:
+              print("⚠️ 未发现独立子目录产物，尝试检查 dist 根目录...")
+          EOF
+
+          echo "=== 检查最终 dist/web 产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并执行 24MB 自动切片防御（兼容处理所有 wasm，包括 SIMD worker）
+      # 8. 深度压缩 wasm 并执行 24MB 自动切片防御
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
