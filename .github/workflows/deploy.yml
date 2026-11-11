@@ -56,7 +56,7 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 配置 Fat LTO 极致压缩并深度修改底层默认中文
+      # 6. 配置 Fat LTO 极致压缩并精准锁定中文默认 (prefs.rs & ui-text)
       - name: Optimize Profile and Set Chinese Default
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
@@ -98,38 +98,40 @@ jobs:
                   f.writelines(filtered)
               print("✅ Cargo.toml 已更新为 Fat LTO 极致压缩配置")
 
-          # 2. 深度穿透扫描所有 Rust 源码，全面修改默认语言为中文
+          # 2. 全局精准定位并替换首选项 prefs.rs
           for root, _, files in os.walk("."):
-              if any(k in root for k in ["target", ".git", "dist"]):
-                  continue
               for file in files:
                   if file.endswith(".rs"):
-                      path = os.path.join(root, file)
+                      p = os.path.join(root, file)
                       try:
-                          with open(path, "r", encoding="utf-8") as f:
-                              code = f.read()
-                          orig = code
+                          with open(p, "r", encoding="utf-8") as f:
+                              c = f.read()
+                          orig = c
 
-                          code = code.replace('"en-US"', '"zh-CN"')
-                          code = code.replace('"en_US"', '"zh_CN"')
-                          code = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', code)
-                          code = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', code)
-                          code = re.sub(r'const\s+ENGLISH_ID:\s*&str\s*=\s*"en";', 'const ENGLISH_ID: &str = "zh";', code)
-                          code = re.sub(r'language:\s*String\s*=\s*"system"\.into\(\)', 'language: String = "zh".into()', code)
-                          code = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', code)
-                          code = re.sub(r'locale:\s*String\s*=\s*"en"[^;]*;', 'locale: String = "zh".into();', code)
+                          # 精准替换首选项中的默认语言
+                          if 'language: String = "system".into()' in c:
+                              c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
+                              print(f"✅ 成功将首选项默认语言锁定为 zh: {p}")
 
-                          if "enum Language" in code or "Language::English" in code:
-                              for target in ["Language::Chinese", "Language::Zh", "Language::ZhHans", "Language::SimplifiedChinese"]:
-                                  if target in code:
-                                      code = re.sub(r'impl\s+Default\s+for\s+Language\s*\{[^}]*English[^}]*\}', f'impl Default for Language {{\n    fn default() -> Self {{\n        {target}\n    }}\n}}', code)
-                                      code = code.replace("Language::English", target)
-                                      break
+                          # 精准替换 fallback 语言常量
+                          if 'const ENGLISH_ID: &str = "en";' in c:
+                              c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
+                              print(f"✅ 成功将系统底层 fallback 语言锁定为 zh: {p}")
 
-                          if code != orig:
-                              with open(path, "w", encoding="utf-8") as f:
-                                  f.write(code)
-                              print(f"Patched default language to Chinese in {path}")
+                          if 'const DEFAULT_LANG: &str = "en";' in c:
+                              c = c.replace('const DEFAULT_LANG: &str = "en";', 'const DEFAULT_LANG: &str = "zh";')
+                              print(f"✅ 成功修改 DEFAULT_LANG: {p}")
+
+                          if 'const FALLBACK_LANG: &str = "en";' in c:
+                              c = c.replace('const FALLBACK_LANG: &str = "en";', 'const FALLBACK_LANG: &str = "zh";')
+                              print(f"✅ 成功修改 FALLBACK_LANG: {p}")
+
+                          # 通用正则匹配
+                          c = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', c)
+
+                          if c != orig:
+                              with open(p, "w", encoding="utf-8") as f:
+                                  f.write(c)
                       except Exception:
                           pass
 
