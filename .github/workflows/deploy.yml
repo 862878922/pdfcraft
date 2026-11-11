@@ -56,7 +56,7 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 先执行 cargo fetch 下载依赖，随后对 craft-i18n 及本地源码进行深度中文植入
+      # 6. 先执行 cargo fetch 下载依赖，随后对 craft-i18n 及本地源码进行类型安全的中文植入
       - name: Patch Dependencies and Inject Chinese Pack
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
@@ -128,7 +128,7 @@ jobs:
               "Rotate": "旋转",
               "Rotate Clockwise": "顺时针旋转",
               "Rotate Counterclockwise": "逆时针旋转",
-              "English": "English (英文)",
+              "English": "English",
               "Auto": "跟随系统",
               "System": "跟随系统",
               "Cancel": "取消",
@@ -164,7 +164,7 @@ jobs:
                                   f.write(txt)
                               print(f"✅ 已汉化依赖库词条: {fp}")
 
-              # 修改外部依赖源码中的支持语言定义
+              # 修改外部依赖源码中的支持语言定义（精确元组替换）
               for file in files:
                   if file.endswith(".rs") and ("craft-i18n" in root or "craft_i18n" in root):
                       rs_path = os.path.join(root, file)
@@ -172,13 +172,12 @@ jobs:
                           with open(rs_path, "r", encoding="utf-8") as f:
                               src = f.read()
                           orig = src
-                          # 注入中文语言选项
-                          if '["en"]' in src:
+                          
+                          # 精准元组替换：保持 (&str, &str) 结构完整
+                          if '("en", "English")' in src and '("zh", "简体中文")' not in src:
+                              src = src.replace('("en", "English")', '("zh", "简体中文"), ("en", "English")')
+                          if '["en"]' in src and '["zh", "en"]' not in src:
                               src = src.replace('["en"]', '["zh", "en"]')
-                          if '"en"' in src and '"zh"' not in src:
-                              src = src.replace('"en"', '"zh"')
-                          if 'default_language' in src and '"en"' in src:
-                              src = src.replace('"en"', '"zh"')
 
                           if src != orig:
                               with open(rs_path, "w", encoding="utf-8") as f:
@@ -187,7 +186,7 @@ jobs:
                       except Exception:
                           pass
 
-          # 3. 递归扫描本地源码，锁定中文与默认语言
+          # 3. 递归扫描本地源码，安全注入中文选项与默认值
           for root, _, files in os.walk("."):
               if any(k in root for k in ["target", ".git", "dist"]):
                   continue
@@ -199,17 +198,14 @@ jobs:
                               c = f.read()
                           orig = c
 
+                          # 核心：精准替换 i18n 语言列表定义，保证还是二元元组
+                          if '("en", "English")' in c and '("zh", "简体中文")' not in c:
+                              c = c.replace('("en", "English")', '("zh", "简体中文"), ("en", "English")')
+
                           c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
                           c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
                           c = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', c)
                           c = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', c)
-                          c = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', c)
-
-                          # 扩展设置界面下拉菜单选项
-                          if '"English"' in c and '"简体中文"' not in c:
-                              c = c.replace('"English"', '"English", "简体中文"')
-                          if '"en"' in c and '"zh"' not in c:
-                              c = c.replace('["en"]', '["zh", "en"]')
 
                           if c != orig:
                               with open(path, "w", encoding="utf-8") as f:
@@ -275,7 +271,7 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并执行强制切片（保证单文件小于 20MB）
+      # 8. 深度压缩 wasm 并执行强制切片（保证单文件小于 20MB，规避 Cloudflare 限制）
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
