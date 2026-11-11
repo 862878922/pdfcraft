@@ -56,7 +56,7 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 配置 Fat LTO 极致体积压缩并注入默认中文
+      # 6. 配置 Fat LTO 极致体积压缩，并对 Rust 底层 i18n 进行深度中文默认注入
       - name: Optimize Profile and Set Chinese Default
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
@@ -96,52 +96,78 @@ jobs:
 
               with open(cargo_file, "w", encoding="utf-8") as f:
                   f.writelines(filtered)
-              print("Cargo.toml configured with Fat LTO for extreme binary compression.")
+              print("Cargo.toml configured with Fat LTO.")
 
-          # 2. 扫描源码并将默认语言修改为中文
-          for root, _, files in os.walk("crates"):
+          # 2. 深度穿透扫描所有 crates 源码，强行将默认语言与 fallback 切换为中文
+          print("=== 开始深度替换语言默认设置 ===")
+          for root, _, files in os.walk("."):
+              # 跳过编译缓存与产物目录
+              if any(k in root for k in ["target", ".git", "dist"]):
+                  continue
               for file in files:
                   if file.endswith(".rs"):
                       path = os.path.join(root, file)
                       try:
                           with open(path, "r", encoding="utf-8") as f:
                               code = f.read()
-                          new_code = code
-                          if "Language::English" in new_code:
+                          orig = code
+
+                          # 匹配常规 i18n 常量与回退定义
+                          code = code.replace('"en-US"', '"zh-CN"')
+                          code = code.replace('"en_US"', '"zh_CN"')
+                          
+                          # 匹配默认语言常量
+                          code = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', code)
+                          code = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', code)
+                          code = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', code)
+                          code = re.sub(r'locale:\s*String\s*=\s*"en"[^;]*;', 'locale: String = "zh".into();', code)
+
+                          # 匹配语言枚举默认值（Default::default()）
+                          if "enum Language" in code or "Language::English" in code:
                               for target in ["Language::Chinese", "Language::Zh", "Language::ZhHans", "Language::SimplifiedChinese"]:
                                   if target in code:
-                                      new_code = new_code.replace("Language::English", target)
+                                      code = re.sub(r'impl\s+Default\s+for\s+Language\s*\{[^}]*English[^}]*\}', f'impl Default for Language {{\n    fn default() -> Self {{\n        {target}\n    }}\n}}', code)
+                                      code = code.replace("Language::English", target)
                                       break
-                          new_code = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', new_code)
-                          new_code = re.sub(r'default_lang\s*=\s*"en"', 'default_lang = "zh"', new_code)
-                          if new_code != code:
+
+                          if code != orig:
                               with open(path, "w", encoding="utf-8") as f:
-                                  f.write(new_code)
-                              print(f"Patched default language to Chinese in {path}")
-                      except Exception:
+                                  f.write(code)
+                              print(f"✅ 成功将默认中文逻辑写入: {path}")
+                      except Exception as e:
                           pass
 
-          # 3. 为 apps/pdfcraft-web/index.html 注入默认中文 localStorage
+          # 3. 前端 index.html 模拟 navigator.languages 与清理旧语言缓存
           target_html = "apps/pdfcraft-web/index.html"
           if os.path.exists(target_html):
               with open(target_html, "r", encoding="utf-8") as f:
                   html = f.read()
-              script = (
-                  "<script>\n"
-                  "try {\n"
-                  "  if (!localStorage.getItem('pdfcraft_language') && !localStorage.getItem('language')) {\n"
-                  "    localStorage.setItem('pdfcraft_language', 'zh');\n"
-                  "    localStorage.setItem('language', 'zh');\n"
-                  "    localStorage.setItem('locale', 'zh');\n"
-                  "  }\n"
-                  "} catch(e) {}\n"
-                  "</script>\n"
-              )
-              if "<head>" in html and "pdfcraft_language" not in html:
-                  html = html.replace("<head>", "<head>\n" + script)
+
+              # 注入浏览器环境伪装：强行重写 navigator.language 返回中文，并清除本地旧英文缓存
+              force_zh_script = """
+<script>
+  (function() {
+    try {
+      // 覆盖浏览器语言探测为简体中文
+      Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });
+      Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });
+
+      // 遍历所有可能的 storage key，设置默认中文
+      var keys = ['pdfcraft_language', 'language', 'locale', 'app_lang', 'selected_language'];
+      keys.forEach(function(k) {
+        if (!localStorage.getItem(k) || localStorage.getItem(k).indexOf('en') !== -1) {
+          localStorage.setItem(k, 'zh');
+        }
+      });
+    } catch(e) {}
+  })();
+</script>
+"""
+              if "<head>" in html and "Object.defineProperty(navigator" not in html:
+                  html = html.replace("<head>", "<head>\n" + force_zh_script)
                   with open(target_html, "w", encoding="utf-8") as f:
                       f.write(html)
-                  print("apps/pdfcraft-web/index.html injected with Chinese default script.")
+                  print("✅ apps/pdfcraft-web/index.html 已成功注入 navigator 语言重定向脚本")
           PYEOF
 
           python3 patch_all.py
@@ -178,7 +204,7 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并通过纯原生 Fetch 还原分片（无语法冲突）
+      # 8. 深度压缩 wasm 并通过纯原生 Fetch 还原分片
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
@@ -243,7 +269,6 @@ jobs:
 
                       parts_json_str = json.dumps(chunks)
                       
-                      # 构造纯净 JS 拦截器字符串
                       js_lines = [
                           "<script>",
                           "(function() {",
@@ -262,7 +287,7 @@ jobs:
                           "          return r.arrayBuffer();",
                           "        });",
                           "      }));",
-                          "      var total = buffers.reduce(function(acc, b) { return acc + b.byteLength; }, 0);",
+                          "      var total = buffers.reduce(function(acc, b) { return acc + b.byteLength, 0);",
                           "      var merged = new Uint8Array(total);",
                           "      var offset = 0;",
                           "      for (var i = 0; i < buffers.length; i++) {",
