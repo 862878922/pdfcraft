@@ -52,9 +52,10 @@ jobs:
           sudo cp binaryen-version_122/bin/* /usr/local/bin/
           wasm-opt --version
 
-      # 6. 配置体积压缩、关闭 Trunk 老旧 wasm-opt，并自动注入默认中文设置
+      # 6. 配置安全体积压缩配置（不破坏 workspace），并设置中文默认
       - name: Optimize Profile and Set Chinese Default
         run: |
+          # 禁用 Trunk 内置 wasm-opt 避免报错
           if [ -f "Trunk.toml" ]; then
             sed -i 's/wasm_opt = true/wasm_opt = false/g' Trunk.toml || true
             sed -i 's/wasm_opt = "z"/wasm_opt = false/g' Trunk.toml || true
@@ -66,12 +67,24 @@ jobs:
           cat << 'PYEOF' > patch_chinese_and_profile.py
           import os, re
 
-          # 1. 配置 Cargo.toml 最小体积 profile
+          # 1. 安全追加/替换 release profile，绝不截断或替换其他 workspace 内容
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
-                  content = f.read()
+                  lines = f.readlines()
               
+              # 清理现有的 [profile.release] 块，避免格式冲突
+              filtered = []
+              skip = False
+              for line in lines:
+                  if line.strip().startswith("[profile.release"):
+                      skip = True
+                      continue
+                  if skip and line.strip().startswith("["):
+                      skip = False
+                  if not skip:
+                      filtered.append(line)
+
               opt_profile = (
                   "\n[profile.release]\n"
                   'opt-level = "z"\n'
@@ -81,13 +94,11 @@ jobs:
                   "strip = true\n"
                   "debug = 0\n"
               )
-              if "[profile.release]" in content:
-                  content = re.sub(r'\[profile\.release\][^\[]*', opt_profile.strip() + "\n\n", content)
-              else:
-                  content += opt_profile
+              filtered.append(opt_profile)
+
               with open(cargo_file, "w", encoding="utf-8") as f:
-                  f.write(content)
-              print("Cargo.toml profile configured.")
+                  f.writelines(filtered)
+              print("✅ Cargo.toml profile safely updated.")
 
           # 2. 扫描并自动将默认语言修改为中文
           for root, _, files in os.walk("crates"):
@@ -137,13 +148,13 @@ jobs:
           python3 patch_chinese_and_profile.py
           rm -f patch_chinese_and_profile.py
 
-      # 7. 构建 WebAssembly 产物
+      # 7. 构建 WebAssembly 产物（指定 index.html 构建）
       - name: Build Web Application
         env:
           CARGO_BUILD_JOBS: 2
         run: |
-          trunk build --release
-          echo "=== 检查初步构建产物 ==="
+          trunk build --release index.html
+          echo "=== 检查构建产物 ==="
           ls -lh dist/
 
       # 8. 深度压缩 wasm 并执行 24MB 自动切片防御
@@ -230,7 +241,7 @@ jobs:
           echo "=== 最终提交部署的文件列表 ==="
           ls -lh dist/
 
-      # 9. 部署发布到 Cloudflare Pages (使用官方 Wrangler Action 并强制校验输出)
+      # 9. 部署发布到 Cloudflare Pages
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
         with:
