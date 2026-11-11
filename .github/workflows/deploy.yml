@@ -56,23 +56,20 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 本地克隆 craft-libs 并通过 Cargo [patch] 机制硬核注入中文包
-      - name: Local Patch craft-i18n and Inject Chinese Translations
+      # 6. 下载官方 craft-i18n 仓库，生成中文 TSV 词库并在源码中激活注册
+      - name: Prepare craft-i18n Catalogs and Register Chinese
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
           find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
 
-          # 克隆匹配版本的 craft-libs 到本地
-          git clone https://github.com/storytold/craft-libs.git local_craft_libs
-          cd local_craft_libs
-          git checkout 787a7a0f972fd1d7a7618fdbeca3a5267a0407ff || true
-          cd ..
+          # 1. 克隆官方 craft-i18n 仓库
+          git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
 
-          cat << 'PYEOF' > patch_craft_libs.py
+          cat << 'PYEOF' > setup_chinese_i18n.py
           import os, re, shutil
 
-          # 1. 深度配置 Cargo.toml 最小体积 Profile 并重定向 craft-libs 为本地 patch
+          # 1. 配置 Cargo.toml 最小体积 Profile
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
@@ -98,106 +95,96 @@ jobs:
                   "debug = 0\n"
               )
               filtered.append(opt_profile)
-
-              # 核心：使用 Cargo patch 强行替换远程依赖
-              patch_block = (
-                  "\n[patch.\"https://github.com/storytold/craft-libs.git\"]\n"
-                  'craft-i18n = { path = "local_craft_libs/crates/i18n" }\n'
-              )
-              filtered.append(patch_block)
-
               with open(cargo_file, "w", encoding="utf-8") as f:
                   f.writelines(filtered)
-              print("✅ Cargo.toml 已成功配置 Fat LTO 与 local_craft_libs 覆盖映射")
+              print("✅ Cargo.toml Fat LTO 配置完成")
 
-          # 2. 为 local_craft_libs 汉化并添加 zh 语言包
-          i18n_dir = "local_craft_libs/crates/i18n"
-          if os.path.exists(i18n_dir):
-              # 搜索 locales 文件夹
-              loc_dir = None
-              for r, dirs, _ in os.walk(i18n_dir):
-                  if "locales" in dirs:
-                      loc_dir = os.path.join(r, "locales")
-                      break
-              if not loc_dir:
-                  loc_dir = os.path.join(i18n_dir, "locales")
+          # 2. 检查并生成 craft-i18n 中的中文 TSV 字典
+          i18n_root = os.environ.get("GITHUB_WORKSPACE", "") + "/craft-i18n/locales"
+          en_dir = os.path.join(i18n_root, "en")
+          zh_dir = os.path.join(i18n_root, "zh")
+          os.makedirs(zh_dir, exist_ok=True)
 
-              en_dir = os.path.join(loc_dir, "en")
-              zh_dir = os.path.join(loc_dir, "zh")
-              if os.path.exists(en_dir):
-                  if not os.path.exists(zh_dir):
-                      shutil.copytree(en_dir, zh_dir)
-                      print(f"✅ 已在 local_craft_libs 成功创建 zh 目录: {zh_dir}")
+          # 汉化词汇字典
+          translations = {
+              "File": "文件",
+              "Open": "打开",
+              "Open...": "打开...",
+              "Save": "保存",
+              "Save As": "另存为",
+              "Save As...": "另存为...",
+              "Export": "导出",
+              "Print": "打印",
+              "Print...": "打印...",
+              "Settings": "设置",
+              "Preferences": "首选项",
+              "Language": "语言",
+              "Help": "帮助",
+              "About": "关于",
+              "Close": "关闭",
+              "Edit": "编辑",
+              "View": "视图",
+              "Tools": "工具",
+              "Page": "页面",
+              "Pages": "页面",
+              "Zoom": "缩放",
+              "Fit": "适应宽度",
+              "Fit Width": "适应宽度",
+              "Fit Page": "适合整页",
+              "Rotate": "旋转",
+              "Rotate Clockwise": "顺时针旋转",
+              "Rotate Counterclockwise": "逆时针旋转",
+              "English": "English",
+              "Auto": "跟随系统",
+              "System": "跟随系统",
+              "Cancel": "取消",
+              "OK": "确定",
+              "Apply": "应用"
+          }
 
-                  translations = {
-                      "File": "文件",
-                      "Open": "打开",
-                      "Open...": "打开...",
-                      "Save": "保存",
-                      "Save As": "另存为",
-                      "Save As...": "另存为...",
-                      "Export": "导出",
-                      "Print": "打印",
-                      "Print...": "打印...",
-                      "Settings": "设置",
-                      "Preferences": "首选项",
-                      "Language": "语言",
-                      "Help": "帮助",
-                      "About": "关于",
-                      "Close": "关闭",
-                      "Edit": "编辑",
-                      "View": "视图",
-                      "Tools": "工具",
-                      "Page": "页面",
-                      "Pages": "页面",
-                      "Zoom": "缩放",
-                      "Fit": "适应宽度",
-                      "Fit Width": "适应宽度",
-                      "Fit Page": "适合整页",
-                      "Rotate": "旋转",
-                      "Rotate Clockwise": "顺时针旋转",
-                      "Rotate Counterclockwise": "逆时针旋转",
-                      "English": "English",
-                      "Auto": "跟随系统",
-                      "System": "跟随系统",
-                      "Cancel": "取消",
-                      "OK": "确定",
-                      "Apply": "应用"
-                  }
+          for fname in ["common.tsv", "pdfcraft.tsv"]:
+              src = os.path.join(en_dir, fname)
+              dst = os.path.join(zh_dir, fname)
+              if os.path.exists(src):
+                  with open(src, "r", encoding="utf-8") as f:
+                      lines = f.readlines()
+                  out_lines = []
+                  for line in lines:
+                      # TSV 行格式: context \t English \t translation
+                      parts = line.rstrip("\r\n").split("\t")
+                      if len(parts) >= 2:
+                          en_text = parts[1]
+                          trans = translations.get(en_text, en_text)
+                          out_lines.append(f"{parts[0]}\t{en_text}\t{trans}\n")
+                      else:
+                          out_lines.append(line)
+                  # 写入语言名称标识
+                  if fname == "pdfcraft.tsv":
+                      out_lines.insert(0, "@id\tlanguage.name\t简体中文\n")
+                  with open(dst, "w", encoding="utf-8") as f:
+                      f.writelines(out_lines)
+                  print(f"✅ 已生成中文翻译词库: {dst}")
 
-                  for ftl in os.listdir(zh_dir):
-                      if ftl.endswith(".ftl"):
-                          fp = os.path.join(zh_dir, ftl)
-                          with open(fp, "r", encoding="utf-8") as f:
-                              txt = f.read()
-                          for k, v in translations.items():
-                              txt = re.sub(rf'=\s*{re.escape(k)}\b', f'= {v}', txt)
-                              txt = re.sub(rf'=\s*"{re.escape(k)}"', f'= "{v}"', txt)
-                          with open(fp, "w", encoding="utf-8") as f:
-                              f.write(txt)
-                          print(f"✅ 已汉化词条文件: {fp}")
+          # 3. 在 crates/ui-egui/src/i18n.rs 中注册中文语言
+          i18n_rs = "crates/ui-egui/src/i18n.rs"
+          if os.path.exists(i18n_rs):
+              with open(i18n_rs, "r", encoding="utf-8") as f:
+                  code = f.read()
+              
+              # 注册 ("zh", false) 到 LANGUAGES 常量
+              if '("en", false)' in code and '("zh", false)' not in code:
+                  code = code.replace('("en", false)', '("zh", false),\n    ("en", false)')
+                  print("✅ 成功在 LANGUAGES 中注册 ('zh', false)")
+              
+              # 在 english_name 函数中追加 "zh" => "Simplified Chinese"
+              if '"en" => "English"' in code and '"zh" =>' not in code:
+                  code = code.replace('"en" => "English"', '"zh" => "Simplified Chinese",\n        "en" => "English"')
+                  print("✅ 成功在 english_name 中追加中文选项映射")
+              
+              with open(i18n_rs, "w", encoding="utf-8") as f:
+                  f.write(code)
 
-              # 修改 local_craft_libs 源码中的语言支持列表
-              for r, _, fls in os.walk(i18n_dir):
-                  for fl in fls:
-                      if fl.endswith(".rs"):
-                          sp = os.path.join(r, fl)
-                          with open(sp, "r", encoding="utf-8") as f:
-                              s = f.read()
-                          orig_s = s
-                          if '("en", "English")' in s and '("zh", "简体中文")' not in s:
-                              s = s.replace('("en", "English")', '("zh", "简体中文"), ("en", "English")')
-                          if '["en"]' in s and '["zh", "en"]' not in s:
-                              s = s.replace('["en"]', '["zh", "en"]')
-                          if '"en"' in s and '"zh"' not in s and "const" in s:
-                              s = s.replace('"en"', '"zh"')
-
-                          if s != orig_s:
-                              with open(sp, "w", encoding="utf-8") as f:
-                                  f.write(s)
-                              print(f"✅ 已成功修改 local_craft_libs 源码: {sp}")
-
-          # 3. 扫描本地源码，将语言列表与默认语言精准锁定
+          # 4. 将默认偏好设置为中文 (zh)
           for root, _, files in os.walk("crates"):
               for file in files:
                   if file.endswith(".rs"):
@@ -206,24 +193,16 @@ jobs:
                           with open(path, "r", encoding="utf-8") as f:
                               c = f.read()
                           orig = c
-
-                          # 精准元组替换：只替换 UI 中的语言声明
-                          if '("en", "English")' in c and 'crates/ocr' not in path and '("zh", "简体中文")' not in c:
-                              c = c.replace('("en", "English")', '("zh", "简体中文"), ("en", "English")')
-
                           c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
                           c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
-                          c = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', c)
-                          c = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', c)
-
                           if c != orig:
                               with open(path, "w", encoding="utf-8") as f:
                                   f.write(c)
-                              print(f"✅ 成功修改本地源码首选项: {path}")
+                              print(f"✅ 成功修改底层默认语言: {path}")
                       except Exception:
                           pass
 
-          # 4. 前端 index.html 注入模拟脚本
+          # 5. 前端 index.html 注入模拟脚本
           target_html = "apps/pdfcraft-web/index.html"
           if os.path.exists(target_html):
               with open(target_html, "r", encoding="utf-8") as f:
@@ -247,13 +226,14 @@ jobs:
                   print("✅ apps/pdfcraft-web/index.html 已注入浏览器中文伪装脚本")
           PYEOF
 
-          python3 patch_craft_libs.py
-          rm -f patch_craft_libs.py
+          python3 setup_chinese_i18n.py
+          rm -f setup_chinese_i18n.py
 
-      # 7. 预建产物目录并在根目录执行构建
+      # 7. 传入 CRAFT_I18N_DIR 环境变量并执行 Web 构建
       - name: Build Web Application
         env:
           CARGO_BUILD_JOBS: 2
+          CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
         run: |
           mkdir -p dist/web
           trunk build apps/pdfcraft-web/index.html --release
