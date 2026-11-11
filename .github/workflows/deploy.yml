@@ -45,20 +45,17 @@ jobs:
         with:
           tool: trunk@0.20.3
 
-      # 5. 安装现代 Binaryen (wasm-opt v122) 并创建自动注入 SIMD 支持的 Wrapper
+      # 5. 安装现代 Binaryen (wasm-opt v122) 并创建 SIMD Wrapper (纯单行安全写入，彻底避开 YAML 语法冲突)
       - name: Install Modern Binaryen & Setup SIMD Wrapper
         run: |
           curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
           sudo cp binaryen-version_122/bin/* /usr/local/bin/
           
-          # 将原始 wasm-opt 重命名为 wasm-opt-raw
+          # 将原始 wasm-opt 换名为 wasm-opt-raw
           sudo mv /usr/local/bin/wasm-opt /usr/local/bin/wasm-opt-raw
           
-          # 创建智能 Wrapper 脚本：强制注入 --enable-simd 和 --all-features 避免验证器报错
-          sudo bash -c 'cat << "EOF" > /usr/local/bin/wasm-opt
-#!/bin/bash
-exec /usr/local/bin/wasm-opt-raw --all-features --enable-simd "$@"
-EOF'
+          # 建立 wrapper 脚本，自动透传 --all-features 与 --enable-simd 参数
+          printf '#!/bin/bash\nexec /usr/local/bin/wasm-opt-raw --all-features --enable-simd "$@"\n' | sudo tee /usr/local/bin/wasm-opt > /dev/null
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
@@ -103,7 +100,7 @@ EOF'
 
               with open(cargo_file, "w", encoding="utf-8") as f:
                   f.writelines(filtered)
-              print("✅ Cargo.toml 优化配置更新完成")
+              print("Cargo.toml release profile safe updated.")
 
           # 2. 扫描源码并将默认语言修改为中文
           for root, _, files in os.walk("crates"):
@@ -148,7 +145,7 @@ EOF'
                   html = html.replace("<head>", "<head>\n" + script)
                   with open(target_html, "w", encoding="utf-8") as f:
                       f.write(html)
-                  print("✅ apps/pdfcraft-web/index.html 注入中文初始化脚本成功")
+                  print("apps/pdfcraft-web/index.html injected with Chinese default script.")
           PYEOF
 
           python3 patch_all.py
@@ -178,39 +175,38 @@ EOF'
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并执行 24MB 自动切片防御（兼容处理所有 wasm，包括 worker）
+      # 8. 深度压缩 wasm 并执行 24MB 自动切片防御（兼容处理所有 wasm，包括 SIMD worker）
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
           cat << 'PYEOF' > split_wasm.py
           import os, glob, re, subprocess
 
-          # 寻找 dist/web 及其子目录下所有的 wasm 文件
           wasm_files = glob.glob("dist/web/**/*.wasm", recursive=True)
           if not wasm_files:
               wasm_files = glob.glob("dist/**/*.wasm", recursive=True)
           
           if not wasm_files:
-              print("❌ 未在 dist 目录下找到 wasm 目标文件")
+              print("No wasm found in dist")
               exit(1)
 
           for wasm_path in wasm_files:
               wasm_dir = os.path.dirname(wasm_path)
               wasm_filename = os.path.basename(wasm_path)
-              print(f"\n--- 处理: {wasm_filename} ---")
+              print(f"\n--- Processing: {wasm_filename} ---")
               
               # 1. 深度优化瘦身（带 --all-features 支持 SIMD）
               cmd = ["/usr/local/bin/wasm-opt-raw", "--all-features", "-Oz", "--strip-debug", "--strip-producers", wasm_path, "-o", wasm_path]
               try:
                   subprocess.run(cmd, check=True)
-                  print(f"优化完成: {os.path.getsize(wasm_path)/(1024*1024):.2f} MB")
+                  print(f"Optimized size: {os.path.getsize(wasm_path)/(1024*1024):.2f} MB")
               except Exception as e:
-                  print(f"wasm-opt 优化跳过: {e}")
+                  print(f"wasm-opt skipped: {e}")
 
-              # 2. 检查是否越过 Cloudflare 25MB 上限 (主页面 bg.wasm 才会触发 index.html 切片)
+              # 2. 检查是否超过 Cloudflare 25MB 上限 (主页面 bg.wasm 才会触发 index.html 切片)
               size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
               if size_mb > 24.0 and "_bg.wasm" in wasm_filename:
-                  print(f"⚠️ {wasm_filename} 体积大于 24MB ({size_mb:.2f} MB)，启动自动分片机制...")
+                  print(f"Size exceeds 24MB ({size_mb:.2f} MB), splitting chunks...")
                   chunk_size = 15 * 1024 * 1024
                   with open(wasm_path, "rb") as f:
                       data = f.read()
@@ -222,7 +218,7 @@ EOF'
                       with open(part_path, "wb") as pf:
                           pf.write(data[i:i+chunk_size])
                       chunks.append(f"./{part_name}")
-                      print(f"  已生成分片: {part_name}")
+                      print(f"Generated part: {part_name}")
 
                   os.remove(wasm_path)
 
@@ -256,9 +252,9 @@ EOF'
 
                       with open(html_path, "w", encoding="utf-8") as f:
                           f.write(html)
-                      print(f"✅ {html_path} 已更新为分片加载器")
+                      print(f"Updated {html_path} with chunk loader.")
               else:
-                  print(f"✅ {wasm_filename} 体积安全 (<= 24MB)")
+                  print(f"Wasm size is safe (<= 24MB)")
           PYEOF
 
           python3 split_wasm.py
