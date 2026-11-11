@@ -56,17 +56,20 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 配置 Fat LTO 极致压缩并配置基础环境
-      - name: Optimize Profile and Inject Chinese Translation Pack
+      # 6. 先执行 cargo fetch 下载依赖，随后对 craft-i18n 及本地源码进行深度中文植入
+      - name: Patch Dependencies and Inject Chinese Pack
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
           find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
 
-          cat << 'PYEOF' > setup_chinese_pack.py
+          # 提前拉取依赖到 ~/.cargo 中
+          cargo fetch
+
+          cat << 'PYEOF' > patch_dependencies.py
           import os, re, shutil
 
-          # 1. 配置 Fat LTO
+          # 1. 配置 Cargo.toml 最小体积 Profile
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
@@ -96,22 +99,95 @@ jobs:
                   f.writelines(filtered)
               print("✅ Cargo.toml Fat LTO 配置完成")
 
-          # 2. 全局搜索 locales 目录，补齐中文语言包
-          locale_dirs = []
-          for root, dirs, _ in os.walk("."):
+          # 核心菜单汉化对照字典
+          translations = {
+              "File": "文件",
+              "Open": "打开",
+              "Open...": "打开...",
+              "Save": "保存",
+              "Save As...": "另存为...",
+              "Save As": "另存为",
+              "Export": "导出",
+              "Print": "打印",
+              "Print...": "打印...",
+              "Settings": "设置",
+              "Preferences": "首选项",
+              "Language": "语言",
+              "Help": "帮助",
+              "About": "关于",
+              "Close": "关闭",
+              "Edit": "编辑",
+              "View": "视图",
+              "Tools": "工具",
+              "Page": "页面",
+              "Pages": "页面",
+              "Zoom": "缩放",
+              "Fit": "适应宽度",
+              "Fit Width": "适应宽度",
+              "Fit Page": "适合整页",
+              "Rotate": "旋转",
+              "Rotate Clockwise": "顺时针旋转",
+              "Rotate Counterclockwise": "逆时针旋转",
+              "English": "English (英文)",
+              "Auto": "跟随系统",
+              "System": "跟随系统",
+              "Cancel": "取消",
+              "OK": "确定",
+              "Apply": "应用"
+          }
+
+          # 2. 深入 Cargo 依赖目录修改 craft-i18n
+          cargo_home = os.environ.get("CARGO_HOME", os.path.expanduser("~/.cargo"))
+          print(f"=== 检查依赖库目录: {cargo_home} ===")
+
+          for root, dirs, files in os.walk(cargo_home):
+              # 搜索包含 locales 文件夹的 craft 依赖库
               if "locales" in dirs:
-                  locale_dirs.append(os.path.join(root, "locales"))
+                  loc_dir = os.path.join(root, "locales")
+                  en_path = os.path.join(loc_dir, "en")
+                  if os.path.exists(en_path):
+                      zh_path = os.path.join(loc_dir, "zh")
+                      if not os.path.exists(zh_path):
+                          shutil.copytree(en_path, zh_path)
+                          print(f"✅ 在依赖库中注入中文目录: {zh_path}")
+                      
+                      # 翻译所有的 .ftl 资源文件
+                      for ftl in os.listdir(zh_path):
+                          if ftl.endswith(".ftl"):
+                              fp = os.path.join(zh_path, ftl)
+                              with open(fp, "r", encoding="utf-8") as f:
+                                  txt = f.read()
+                              for k, v in translations.items():
+                                  txt = re.sub(rf'=\s*{re.escape(k)}\b', f'= {v}', txt)
+                                  txt = re.sub(rf'=\s*"{re.escape(k)}"', f'= "{v}"', txt)
+                              with open(fp, "w", encoding="utf-8") as f:
+                                  f.write(txt)
+                              print(f"✅ 已汉化依赖库词条: {fp}")
 
-          for ldir in locale_dirs:
-              en_dir = os.path.join(ldir, "en")
-              if os.path.exists(en_dir):
-                  for target_lang in ["zh", "zh-CN"]:
-                      target_dir = os.path.join(ldir, target_lang)
-                      if not os.path.exists(target_dir):
-                          shutil.copytree(en_dir, target_dir)
-                          print(f"✅ 已复制语言目录: {target_dir}")
+              # 修改外部依赖源码中的支持语言定义
+              for file in files:
+                  if file.endswith(".rs") and ("craft-i18n" in root or "craft_i18n" in root):
+                      rs_path = os.path.join(root, file)
+                      try:
+                          with open(rs_path, "r", encoding="utf-8") as f:
+                              src = f.read()
+                          orig = src
+                          # 注入中文语言选项
+                          if '["en"]' in src:
+                              src = src.replace('["en"]', '["zh", "en"]')
+                          if '"en"' in src and '"zh"' not in src:
+                              src = src.replace('"en"', '"zh"')
+                          if 'default_language' in src and '"en"' in src:
+                              src = src.replace('"en"', '"zh"')
 
-          # 3. 替换默认语言逻辑为 zh
+                          if src != orig:
+                              with open(rs_path, "w", encoding="utf-8") as f:
+                                  f.write(src)
+                              print(f"✅ 成功修改依赖项源码: {rs_path}")
+                      except Exception:
+                          pass
+
+          # 3. 递归扫描本地源码，锁定中文与默认语言
           for root, _, files in os.walk("."):
               if any(k in root for k in ["target", ".git", "dist"]):
                   continue
@@ -122,17 +198,52 @@ jobs:
                           with open(path, "r", encoding="utf-8") as f:
                               c = f.read()
                           orig = c
+
                           c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
                           c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
+                          c = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', c)
+                          c = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', c)
+                          c = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', c)
+
+                          # 扩展设置界面下拉菜单选项
+                          if '"English"' in c and '"简体中文"' not in c:
+                              c = c.replace('"English"', '"English", "简体中文"')
+                          if '"en"' in c and '"zh"' not in c:
+                              c = c.replace('["en"]', '["zh", "en"]')
+
                           if c != orig:
                               with open(path, "w", encoding="utf-8") as f:
                                   f.write(c)
+                              print(f"✅ 已修改本地文件默认语言: {path}")
                       except Exception:
                           pass
+
+          # 4. 在 index.html 中注入浏览器重定向代码
+          target_html = "apps/pdfcraft-web/index.html"
+          if os.path.exists(target_html):
+              with open(target_html, "r", encoding="utf-8") as f:
+                  html = f.read()
+
+              hook_script = (
+                  "<script>\n"
+                  "try {\n"
+                  "  Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
+                  "  Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });\n"
+                  "  ['pdfcraft_language', 'language', 'locale', 'app_lang'].forEach(function(k) {\n"
+                  "    localStorage.setItem(k, 'zh');\n"
+                  "  });\n"
+                  "} catch(e) {}\n"
+                  "</script>\n"
+              )
+              if "<head>" in html and "Object.defineProperty(navigator" not in html:
+                  html = html.replace("<head>", "<head>\n" + hook_script)
+                  with open(target_html, "w", encoding="utf-8") as f:
+                      f.write(html)
+                  print("✅ apps/pdfcraft-web/index.html 已注入浏览器中文伪装脚本")
           PYEOF
 
-          python3 setup_chinese_pack.py
-          rm -f setup_chinese_pack.py
+          python3 patch_dependencies.py
+          rm -f patch_dependencies.py
 
       # 7. 预建产物目录并在根目录执行构建
       - name: Build Web Application
@@ -164,7 +275,7 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并执行强制切片（门槛设为 20MB，每片 10MB，规避 Cloudflare 25MB 限制）
+      # 8. 深度压缩 wasm 并执行强制切片（保证单文件小于 20MB）
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
@@ -179,13 +290,11 @@ jobs:
               print("❌ dist 目录下未找到任何 wasm 文件")
               exit(1)
 
-          # 标准 for 循环遍历所有 wasm 文件
           for wasm_path in wasm_files:
               wasm_dir = os.path.dirname(wasm_path)
               wasm_filename = os.path.basename(wasm_path)
               print(f"\n--- 处理文件: {wasm_filename} ---")
               
-              # 1. wasm-opt 极致深度瘦身
               cmd = [
                   "/usr/local/bin/wasm-opt-raw",
                   "--all-features",
@@ -203,11 +312,10 @@ jobs:
               except Exception as e:
                   print(f"wasm-opt 优化过程跳过: {e}")
 
-              # 2. 检查体积，凡是超过 20MB 的，强制切片为 10MB 块
               size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
               if size_mb > 20.0:
                   print(f"⚠️ 文件体积为 {size_mb:.2f} MB，超过 20MB 安全线，启动自动切片机制...")
-                  chunk_size = 10 * 1024 * 1024  # 每片严格限制为 10MB
+                  chunk_size = 10 * 1024 * 1024
                   with open(wasm_path, "rb") as f:
                       data = f.read()
 
@@ -220,11 +328,9 @@ jobs:
                       chunks.append(part_name)
                       print(f"  已生成小切片: {part_name} ({len(data[i:i+chunk_size])/(1024*1024):.2f} MB)")
 
-                  # 立即删除超过大小的原始 wasm，确保不会被传到 Cloudflare
                   os.remove(wasm_path)
                   print(f"✅ 已删除原始超标大文件: {wasm_filename}")
 
-                  # 注入浏览器网络层透明还原合并代码
                   html_path = os.path.join(wasm_dir, "index.html")
                   if os.path.exists(html_path):
                       with open(html_path, "r", encoding="utf-8") as f:
