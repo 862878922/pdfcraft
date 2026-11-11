@@ -39,11 +39,11 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      # 4. 安装 Trunk 打包工具
+      # 4. 安装兼容版 Trunk (锁定 v0.20.3，避免 v0.22 的 workspace 破坏性变更)
       - name: Install Trunk
         uses: taiki-e/install-action@v2
         with:
-          tool: trunk
+          tool: trunk@0.20.3
 
       # 5. 安装现代 Binaryen (wasm-opt v122)
       - name: Install Modern Binaryen (wasm-opt v122)
@@ -52,9 +52,10 @@ jobs:
           sudo cp binaryen-version_122/bin/* /usr/local/bin/
           wasm-opt --version
 
-      # 6. 配置体积压缩、关闭 Trunk 老旧 wasm-opt，并自动注入默认中文设置
+      # 6. 配置体积压缩、修复 Trunk 目标 crate 映射并设置默认中文
       - name: Optimize Profile and Set Chinese Default
         run: |
+          # 禁用 Trunk 内置 wasm-opt，避免多重调用
           if [ -f "Trunk.toml" ]; then
             sed -i 's/wasm_opt = true/wasm_opt = false/g' Trunk.toml || true
             sed -i 's/wasm_opt = "z"/wasm_opt = false/g' Trunk.toml || true
@@ -63,10 +64,23 @@ jobs:
             sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' index.html || true
           fi
 
-          cat << 'PYEOF' > patch_chinese_and_profile.py
+          cat << 'PYEOF' > patch_all.py
           import os, re
 
-          # 1. 安全追加/替换 release profile，确保不破坏 workspace 结构
+          # 1. 修复 index.html 中 trunk 的 crate 声明 (解决 could not find the root package 报错)
+          for html_file in ["index.html", "crates/pdfcraft/index.html"]:
+              if os.path.exists(html_file):
+                  with open(html_file, "r", encoding="utf-8") as f:
+                      html_content = f.read()
+                  
+                  # 显式声明 data-package="pdfcraft"
+                  if 'data-trunk rel="rust"' in html_content and 'data-package' not in html_content:
+                      html_content = html_content.replace('data-trunk rel="rust"', 'data-trunk rel="rust" data-package="pdfcraft"')
+                      with open(html_file, "w", encoding="utf-8") as f:
+                          f.write(html_content)
+                      print(f"✅ 已在 {html_file} 中注入 data-package='pdfcraft'")
+
+          # 2. 安全追加/替换 release profile，保证不损坏 workspace 配置
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
@@ -96,9 +110,9 @@ jobs:
 
               with open(cargo_file, "w", encoding="utf-8") as f:
                   f.writelines(filtered)
-              print("✅ Cargo.toml 配置文件已安全更新。")
+              print("✅ Cargo.toml 优化配置更新完成")
 
-          # 2. 扫描并自动将默认语言修改为中文
+          # 3. 扫描源码并将默认语言修改为中文
           for root, _, files in os.walk("crates"):
               for file in files:
                   if file.endswith(".rs"):
@@ -121,7 +135,7 @@ jobs:
                       except Exception:
                           pass
 
-          # 3. 前端 index.html 注入默认中文 localStorage
+          # 4. 前端 index.html 注入默认中文 localStorage
           if os.path.exists("index.html"):
               with open("index.html", "r", encoding="utf-8") as f:
                   html = f.read()
@@ -140,18 +154,18 @@ jobs:
                   html = html.replace("<head>", "<head>\n" + script)
                   with open("index.html", "w", encoding="utf-8") as f:
                       f.write(html)
-                  print("Injected Chinese default script into index.html")
+                  print("✅ index.html 注入默认中文存储成功")
           PYEOF
 
-          python3 patch_chinese_and_profile.py
-          rm -f patch_chinese_and_profile.py
+          python3 patch_all.py
+          rm -f patch_all.py
 
-      # 7. 构建 WebAssembly 产物（规范传参，避免把 index.html 吞为 release 参数）
+      # 7. 构建 WebAssembly 产物
       - name: Build Web Application
         env:
           CARGO_BUILD_JOBS: 2
         run: |
-          trunk build index.html --release
+          trunk build --release
           echo "=== 检查构建产物 ==="
           ls -lh dist/
 
