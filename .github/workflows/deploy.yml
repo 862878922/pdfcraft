@@ -56,7 +56,7 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 配置 Fat LTO 极致压缩并自动创建并注册中文语言包
+      # 6. 配置 Fat LTO 极致压缩并配置基础环境
       - name: Optimize Profile and Inject Chinese Translation Pack
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
@@ -96,41 +96,11 @@ jobs:
                   f.writelines(filtered)
               print("✅ Cargo.toml Fat LTO 配置完成")
 
-          # 2. 全局搜索 locales 目录，为每个存在的 en 目录创建对应的 zh 和 zh-CN 语言包
+          # 2. 全局搜索 locales 目录，补齐中文语言包
           locale_dirs = []
           for root, dirs, _ in os.walk("."):
               if "locales" in dirs:
                   locale_dirs.append(os.path.join(root, "locales"))
-
-          print("发现的 locales 目录:", locale_dirs)
-          
-          # 核心词汇汉化字典
-          translations = {
-              "File": "文件",
-              "Open": "打开",
-              "Save": "保存",
-              "Save As": "另存为",
-              "Export": "导出",
-              "Settings": "设置",
-              "Preferences": "首选项",
-              "Language": "语言",
-              "Help": "帮助",
-              "About": "关于",
-              "Close": "关闭",
-              "Edit": "编辑",
-              "View": "视图",
-              "Tools": "工具",
-              "Page": "页面",
-              "Pages": "页面",
-              "Zoom": "缩放",
-              "Fit": "适应",
-              "English": "英文",
-              "Auto": "跟随系统",
-              "System": "跟随系统",
-              "Cancel": "取消",
-              "OK": "确定",
-              "Apply": "应用"
-          }
 
           for ldir in locale_dirs:
               en_dir = os.path.join(ldir, "en")
@@ -139,24 +109,9 @@ jobs:
                       target_dir = os.path.join(ldir, target_lang)
                       if not os.path.exists(target_dir):
                           shutil.copytree(en_dir, target_dir)
-                          print(f"✅ 已基于 en 自动创建中文语言目录: {target_dir}")
-                      
-                      # 翻译 .ftl 文件中的基础标签
-                      for ftl_file in os.listdir(target_dir):
-                          if ftl_file.endswith(".ftl"):
-                              fp = os.path.join(target_dir, ftl_file)
-                              with open(fp, "r", encoding="utf-8") as f:
-                                  content = f.read()
-                              
-                              for k, v in translations.items():
-                                  content = re.sub(rf'=\s*{k}\b', f'= {v}', content)
-                                  content = re.sub(rf'=\s*"{k}"', f'= "{v}"', content)
+                          print(f"✅ 已复制语言目录: {target_dir}")
 
-                              with open(fp, "w", encoding="utf-8") as f:
-                                  f.write(content)
-                              print(f"✅ 已汉化词条文件: {fp}")
-
-          # 3. 扫描源码中的语言支持列表，注册中文语言并设置默认值
+          # 3. 替换默认语言逻辑为 zh
           for root, _, files in os.walk("."):
               if any(k in root for k in ["target", ".git", "dist"]):
                   continue
@@ -167,57 +122,13 @@ jobs:
                           with open(path, "r", encoding="utf-8") as f:
                               c = f.read()
                           orig = c
-
-                          # 注册语言列表中增加中文项（如 &["en"] -> &["zh", "en"]）
-                          if '["en"]' in c:
-                              c = c.replace('["en"]', '["zh", "en"]')
-                          if '["en", "system"]' in c:
-                              c = c.replace('["en", "system"]', '["zh", "en", "system"]')
-                          if '["system", "en"]' in c:
-                              c = c.replace('["system", "en"]', '["zh", "system", "en"]')
-
-                          # 针对语言选择下拉菜单的硬编码处理，插入中文标签显示
-                          if '"English"' in c and '"Chinese"' not in c and '"简体中文"' not in c:
-                              # 给匹配语言名称的 match 语句加上中文分支
-                              c = c.replace('"en" => "English"', '"en" => "English",\n        "zh" => "简体中文"')
-                              c = c.replace('"en" => String::from("English")', '"en" => String::from("English"),\n        "zh" => String::from("简体中文")')
-
-                          # 修改默认语言配置
                           c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
                           c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
-                          c = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', c)
-                          c = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', c)
-                          c = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', c)
-
                           if c != orig:
                               with open(path, "w", encoding="utf-8") as f:
                                   f.write(c)
-                              print(f"Patched language registration in {path}")
                       except Exception:
                           pass
-
-          # 4. 在 index.html 中注入浏览器重定向代码
-          target_html = "apps/pdfcraft-web/index.html"
-          if os.path.exists(target_html):
-              with open(target_html, "r", encoding="utf-8") as f:
-                  html = f.read()
-
-              hook_script = (
-                  "<script>\n"
-                  "try {\n"
-                  "  Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
-                  "  Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });\n"
-                  "  ['pdfcraft_language', 'language', 'locale', 'app_lang'].forEach(function(k) {\n"
-                  "    localStorage.setItem(k, 'zh');\n"
-                  "  });\n"
-                  "} catch(e) {}\n"
-                  "</script>\n"
-              )
-              if "<head>" in html and "Object.defineProperty(navigator" not in html:
-                  html = html.replace("<head>", "<head>\n" + hook_script)
-                  with open(target_html, "w", encoding="utf-8") as f:
-                      f.write(html)
-                  print("✅ 已在 index.html 注入中文识别钩子")
           PYEOF
 
           python3 setup_chinese_pack.py
@@ -253,7 +164,7 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并通过纯原生 Fetch 还原分片
+      # 8. 深度压缩 wasm 并执行强制切片（门槛设为 20MB，每片 10MB，规避 Cloudflare 25MB 限制）
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
@@ -265,20 +176,21 @@ jobs:
               wasm_files = glob.glob("dist/**/*.wasm", recursive=True)
           
           if not wasm_files:
-              print("No wasm found in dist")
+              print("❌ dist 目录下未找到任何 wasm 文件")
               exit(1)
 
-          for wasm_path in safe_files := wasm_files:
+          # 标准 for 循环遍历所有 wasm 文件
+          for wasm_path in wasm_files:
               wasm_dir = os.path.dirname(wasm_path)
               wasm_filename = os.path.basename(wasm_path)
-              print(f"\n--- Processing: {wasm_filename} ---")
+              print(f"\n--- 处理文件: {wasm_filename} ---")
               
+              # 1. wasm-opt 极致深度瘦身
               cmd = [
                   "/usr/local/bin/wasm-opt-raw",
                   "--all-features",
                   "--enable-simd",
                   "-Oz",
-                  "--converge",
                   "--strip-debug",
                   "--strip-producers",
                   wasm_path,
@@ -287,14 +199,15 @@ jobs:
               ]
               try:
                   subprocess.run(cmd, check=True)
-                  print(f"Optimized size: {os.path.getsize(wasm_path)/(1024*1024):.2f} MB")
+                  print(f"优化完成，当前大小: {os.path.getsize(wasm_path)/(1024*1024):.2f} MB")
               except Exception as e:
-                  print(f"wasm-opt error: {e}")
+                  print(f"wasm-opt 优化过程跳过: {e}")
 
+              # 2. 检查体积，凡是超过 20MB 的，强制切片为 10MB 块
               size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
-              if size_mb > 24.0:
-                  print(f"Wasm size exceeds 24MB ({size_mb:.2f} MB), splitting chunks...")
-                  chunk_size = 15 * 1024 * 1024
+              if size_mb > 20.0:
+                  print(f"⚠️ 文件体积为 {size_mb:.2f} MB，超过 20MB 安全线，启动自动切片机制...")
+                  chunk_size = 10 * 1024 * 1024  # 每片严格限制为 10MB
                   with open(wasm_path, "rb") as f:
                       data = f.read()
 
@@ -305,10 +218,13 @@ jobs:
                       with open(part_path, "wb") as pf:
                           pf.write(data[i:i+chunk_size])
                       chunks.append(part_name)
-                      print(f"  Generated part: {part_name}")
+                      print(f"  已生成小切片: {part_name} ({len(data[i:i+chunk_size])/(1024*1024):.2f} MB)")
 
+                  # 立即删除超过大小的原始 wasm，确保不会被传到 Cloudflare
                   os.remove(wasm_path)
+                  print(f"✅ 已删除原始超标大文件: {wasm_filename}")
 
+                  # 注入浏览器网络层透明还原合并代码
                   html_path = os.path.join(wasm_dir, "index.html")
                   if os.path.exists(html_path):
                       with open(html_path, "r", encoding="utf-8") as f:
@@ -326,15 +242,15 @@ jobs:
                           "    var args = Array.prototype.slice.call(arguments);",
                           "    var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');",
                           "    if (url.indexOf(targetWasm) !== -1) {",
-                          "      console.log('[ChunkLoader] Fetching and merging wasm parts...');",
+                          "      console.log('[ChunkLoader] 正在并发获取小分片并透明组装...');",
                           "      var basePath = url.substring(0, url.lastIndexOf('/') + 1);",
                           "      var buffers = await Promise.all(parts.map(function(p) {",
                           "        return origFetch(basePath + p).then(function(r) {",
-                          "          if (!r.ok) throw new Error('Part failed: ' + p);",
+                          "          if (!r.ok) throw new Error('分片下载失败: ' + p);",
                           "          return r.arrayBuffer();",
                           "        });",
                           "      }));",
-                          "      var total = buffers.reduce(function(acc, b) { return acc + b.byteLength, 0);",
+                          "      var total = buffers.reduce(function(acc, b) { return acc + b.byteLength; }, 0);",
                           "      var merged = new Uint8Array(total);",
                           "      var offset = 0;",
                           "      for (var i = 0; i < buffers.length; i++) {",
@@ -357,15 +273,15 @@ jobs:
 
                       with open(html_path, "w", encoding="utf-8") as f:
                           f.write(html)
-                      print(f"Transparent chunk loader injected into {html_path}")
+                      print(f"✅ 已在 {html_path} 中注入透明组装脚本")
               else:
-                  print("Wasm size safe (<= 24MB), no splitting needed.")
+                  print(f"✅ 文件体积安全: {size_mb:.2f} MB (<= 20MB)，无需切片")
           PYEOF
 
           python3 split_wasm.py
           rm -f split_wasm.py
 
-          echo "=== 最终提交部署的文件列表 ==="
+          echo "=== 最终提交部署的文件列表（确认无任何文件大于 20MB） ==="
           ls -lh dist/web/
 
       # 9. 部署发布到 Cloudflare Pages (lotelf-pdf)
