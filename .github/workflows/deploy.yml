@@ -16,7 +16,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 1. 扩容 10GB 虚拟内存，确保深度 Fat LTO 链接不被系统 OOM 终止
+      # 1. 扩容 10GB 虚拟内存，避免 OOM 闪退 (Exit code 143)
       - name: Expand Swap Space (Fix OOM Exit Code 143)
         run: |
           echo "=== 扩容前内存状况 ==="
@@ -56,17 +56,17 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 配置 Fat LTO 极致体积压缩，并对 Rust 底层 i18n 进行深度中文默认注入
+      # 6. 配置 Fat LTO 极致压缩并深度修改底层默认中文
       - name: Optimize Profile and Set Chinese Default
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
           find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
 
-          cat << 'PYEOF' > patch_all.py
+          cat << 'PYEOF' > patch_chinese.py
           import os, re
 
-          # 1. 注入 Fat LTO 与 codegen-units=1 极致体积配置
+          # 1. 注入 Fat LTO 极致体积配置
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
@@ -96,12 +96,10 @@ jobs:
 
               with open(cargo_file, "w", encoding="utf-8") as f:
                   f.writelines(filtered)
-              print("Cargo.toml configured with Fat LTO.")
+              print("✅ Cargo.toml 已更新为 Fat LTO 极致压缩配置")
 
-          # 2. 深度穿透扫描所有 crates 源码，强行将默认语言与 fallback 切换为中文
-          print("=== 开始深度替换语言默认设置 ===")
+          # 2. 深度穿透扫描所有 Rust 源码，全面修改默认语言为中文
           for root, _, files in os.walk("."):
-              # 跳过编译缓存与产物目录
               if any(k in root for k in ["target", ".git", "dist"]):
                   continue
               for file in files:
@@ -112,17 +110,15 @@ jobs:
                               code = f.read()
                           orig = code
 
-                          # 匹配常规 i18n 常量与回退定义
                           code = code.replace('"en-US"', '"zh-CN"')
                           code = code.replace('"en_US"', '"zh_CN"')
-                          
-                          # 匹配默认语言常量
                           code = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', code)
                           code = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', code)
+                          code = re.sub(r'const\s+ENGLISH_ID:\s*&str\s*=\s*"en";', 'const ENGLISH_ID: &str = "zh";', code)
+                          code = re.sub(r'language:\s*String\s*=\s*"system"\.into\(\)', 'language: String = "zh".into()', code)
                           code = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', code)
                           code = re.sub(r'locale:\s*String\s*=\s*"en"[^;]*;', 'locale: String = "zh".into();', code)
 
-                          # 匹配语言枚举默认值（Default::default()）
                           if "enum Language" in code or "Language::English" in code:
                               for target in ["Language::Chinese", "Language::Zh", "Language::ZhHans", "Language::SimplifiedChinese"]:
                                   if target in code:
@@ -133,45 +129,36 @@ jobs:
                           if code != orig:
                               with open(path, "w", encoding="utf-8") as f:
                                   f.write(code)
-                              print(f"✅ 成功将默认中文逻辑写入: {path}")
-                      except Exception as e:
+                              print(f"Patched default language to Chinese in {path}")
+                      except Exception:
                           pass
 
-          # 3. 前端 index.html 模拟 navigator.languages 与清理旧语言缓存
+          # 3. 在 index.html 中注入浏览器语言劫持代码
           target_html = "apps/pdfcraft-web/index.html"
           if os.path.exists(target_html):
               with open(target_html, "r", encoding="utf-8") as f:
                   html = f.read()
 
-              # 注入浏览器环境伪装：强行重写 navigator.language 返回中文，并清除本地旧英文缓存
-              force_zh_script = """
-<script>
-  (function() {
-    try {
-      // 覆盖浏览器语言探测为简体中文
-      Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });
-      Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });
-
-      // 遍历所有可能的 storage key，设置默认中文
-      var keys = ['pdfcraft_language', 'language', 'locale', 'app_lang', 'selected_language'];
-      keys.forEach(function(k) {
-        if (!localStorage.getItem(k) || localStorage.getItem(k).indexOf('en') !== -1) {
-          localStorage.setItem(k, 'zh');
-        }
-      });
-    } catch(e) {}
-  })();
-</script>
-"""
+              hook_script = (
+                  "<script>\n"
+                  "try {\n"
+                  "  Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
+                  "  Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });\n"
+                  "  ['pdfcraft_language', 'language', 'locale', 'app_lang'].forEach(function(k) {\n"
+                  "    localStorage.setItem(k, 'zh');\n"
+                  "  });\n"
+                  "} catch(e) {}\n"
+                  "</script>\n"
+              )
               if "<head>" in html and "Object.defineProperty(navigator" not in html:
-                  html = html.replace("<head>", "<head>\n" + force_zh_script)
+                  html = html.replace("<head>", "<head>\n" + hook_script)
                   with open(target_html, "w", encoding="utf-8") as f:
                       f.write(html)
-                  print("✅ apps/pdfcraft-web/index.html 已成功注入 navigator 语言重定向脚本")
+                  print("✅ apps/pdfcraft-web/index.html 已注入中文浏览器重定向脚本")
           PYEOF
 
-          python3 patch_all.py
-          rm -f patch_all.py
+          python3 patch_chinese.py
+          rm -f patch_chinese.py
 
       # 7. 预建产物目录并在根目录执行构建
       - name: Build Web Application
@@ -181,7 +168,6 @@ jobs:
           mkdir -p dist/web
           trunk build apps/pdfcraft-web/index.html --release
           
-          # 自动全局检索真实产物位置并完整同步到 dist/web/
           python3 - << 'EOF'
           import os, shutil, glob
 
@@ -224,7 +210,6 @@ jobs:
               wasm_filename = os.path.basename(wasm_path)
               print(f"\n--- Processing: {wasm_filename} ---")
               
-              # 1. 深度优化瘦身
               cmd = [
                   "/usr/local/bin/wasm-opt-raw",
                   "--all-features",
@@ -243,7 +228,6 @@ jobs:
               except Exception as e:
                   print(f"wasm-opt error: {e}")
 
-              # 2. 检查体积，如果依然大于 24MB，则分片并通过 Fetch 拦截透明合并
               size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
               if size_mb > 24.0:
                   print(f"Wasm size exceeds 24MB ({size_mb:.2f} MB), splitting chunks...")
@@ -287,7 +271,7 @@ jobs:
                           "          return r.arrayBuffer();",
                           "        });",
                           "      }));",
-                          "      var total = buffers.reduce(function(acc, b) { return acc + b.byteLength, 0);",
+                          "      var total = buffers.reduce(function(acc, b) { return acc + b.byteLength; }, 0);",
                           "      var merged = new Uint8Array(total);",
                           "      var offset = 0;",
                           "      for (var i = 0; i < buffers.length; i++) {",
@@ -312,7 +296,7 @@ jobs:
                           f.write(html)
                       print(f"Transparent chunk loader injected into {html_path}")
               else:
-                  print(f"Wasm size safe (<= 24MB), no splitting needed.")
+                  print("Wasm size safe (<= 24MB), no splitting needed.")
           PYEOF
 
           python3 split_wasm.py
