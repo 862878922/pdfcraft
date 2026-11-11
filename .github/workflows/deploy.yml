@@ -16,7 +16,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 1. 扩容 10GB 虚拟内存，避免 OOM 闪退 (Exit code 143)
+      # 1. 扩容 10GB 虚拟内存，确保深度 Fat LTO 链接不被系统 OOM 终止
       - name: Expand Swap Space (Fix OOM Exit Code 143)
         run: |
           echo "=== 扩容前内存状况 ==="
@@ -51,18 +51,14 @@ jobs:
           curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
           sudo cp binaryen-version_122/bin/* /usr/local/bin/
           
-          # 将原始 wasm-opt 换名为 wasm-opt-raw
           sudo mv /usr/local/bin/wasm-opt /usr/local/bin/wasm-opt-raw
-          
-          # 建立 wrapper 脚本，自动透传 --all-features 与 --enable-simd 参数
           printf '#!/bin/bash\nexec /usr/local/bin/wasm-opt-raw --all-features --enable-simd "$@"\n' | sudo tee /usr/local/bin/wasm-opt > /dev/null
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 配置体积压缩并注入默认中文
+      # 6. 配置 Fat LTO 极致体积压缩并注入默认中文
       - name: Optimize Profile and Set Chinese Default
         run: |
-          # 禁用所有可能的 Trunk 内置冲突配置
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
           find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
@@ -70,7 +66,7 @@ jobs:
           cat << 'PYEOF' > patch_all.py
           import os, re
 
-          # 1. 安全追加/替换 release profile
+          # 1. 注入 Fat LTO 与 codegen-units=1 极致体积配置，直压进入 20MB 安全线
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
@@ -90,8 +86,8 @@ jobs:
               opt_profile = (
                   "\n[profile.release]\n"
                   'opt-level = "z"\n'
-                  'lto = "thin"\n'
-                  "codegen-units = 16\n"
+                  'lto = "fat"\n'
+                  "codegen-units = 1\n"
                   'panic = "abort"\n'
                   "strip = true\n"
                   "debug = 0\n"
@@ -100,7 +96,7 @@ jobs:
 
               with open(cargo_file, "w", encoding="utf-8") as f:
                   f.writelines(filtered)
-              print("Cargo.toml release profile safely updated.")
+              print("Cargo.toml configured with Fat LTO for extreme binary compression.")
 
           # 2. 扫描源码并将默认语言修改为中文
           for root, _, files in os.walk("crates"):
@@ -151,21 +147,18 @@ jobs:
           python3 patch_all.py
           rm -f patch_all.py
 
-      # 7. 执行构建并自动收集产物到 dist/web
+      # 7. 预建产物目录并在根目录执行构建
       - name: Build Web Application
         env:
           CARGO_BUILD_JOBS: 2
         run: |
           mkdir -p dist/web
-          
-          # 执行编译构建
           trunk build apps/pdfcraft-web/index.html --release
           
           # 自动全局检索真实产物位置并完整同步到 dist/web/
           python3 - << 'EOF'
           import os, shutil, glob
 
-          # 查找所有生成的 .wasm 文件位置（排除 target 构建缓存）
           all_wasm = [p for p in glob.glob("**/*.wasm", recursive=True) if "target" not in p and "dist/web" not in p]
           print("发现编译产物路径:", all_wasm)
           
@@ -180,14 +173,12 @@ jobs:
                   else:
                       shutil.copy2(src, dst)
               print("✅ 产物已成功归拢到 dist/web/")
-          else:
-              print("⚠️ 未发现独立子目录产物，尝试检查 dist 根目录...")
           EOF
 
-          echo "=== 检查最终 dist/web 产物 ==="
+          echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并执行 24MB 自动切片防御
+      # 8. 深度压缩 wasm 并通过透明 Fetch 拦截器处理分片（彻底解决黑屏加载问题）
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
@@ -207,18 +198,29 @@ jobs:
               wasm_filename = os.path.basename(wasm_path)
               print(f"\n--- Processing: {wasm_filename} ---")
               
-              # 1. 深度优化瘦身（带 --all-features 支持 SIMD）
-              cmd = ["/usr/local/bin/wasm-opt-raw", "--all-features", "-Oz", "--strip-debug", "--strip-producers", wasm_path, "-o", wasm_path]
+              # 1. 深度优化瘦身（带 --all-features 与 -Oz 极致压榨）
+              cmd = [
+                  "/usr/local/bin/wasm-opt-raw",
+                  "--all-features",
+                  "--enable-simd",
+                  "-Oz",
+                  "--converge",
+                  "--strip-debug",
+                  "--strip-producers",
+                  wasm_path,
+                  "-o",
+                  wasm_path
+              ]
               try:
                   subprocess.run(cmd, check=True)
                   print(f"Optimized size: {os.path.getsize(wasm_path)/(1024*1024):.2f} MB")
               except Exception as e:
-                  print(f"wasm-opt skipped: {e}")
+                  print(f"wasm-opt error: {e}")
 
-              # 2. 检查是否超过 Cloudflare 25MB 上限 (主页面 bg.wasm 才会触发 index.html 切片)
+              # 2. 检查体积，如果依然大于 24MB，则采用透明 Fetch 劫持合并（不改动 Trunk 任何 JS 执行逻辑）
               size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
-              if size_mb > 24.0 and "_bg.wasm" in wasm_filename:
-                  print(f"Size exceeds 24MB ({size_mb:.2f} MB), splitting chunks...")
+              if size_mb > 24.0:
+                  print(f"⚠️ {wasm_filename} 体积大于 24MB ({size_mb:.2f} MB)，启动无损透明分片...")
                   chunk_size = 15 * 1024 * 1024
                   with open(wasm_path, "rb") as f:
                       data = f.read()
@@ -229,9 +231,10 @@ jobs:
                       part_path = os.path.join(wasm_dir, part_name)
                       with open(part_path, "wb") as pf:
                           pf.write(data[i:i+chunk_size])
-                      chunks.append(f"./{part_name}")
-                      print(f"Generated part: {part_name}")
+                      chunks.append(part_name)
+                      print(f"  已生成分片: {part_name}")
 
+                  # 移除超出大小的原始文件
                   os.remove(wasm_path)
 
                   html_path = os.path.join(wasm_dir, "index.html")
@@ -239,34 +242,51 @@ jobs:
                       with open(html_path, "r", encoding="utf-8") as f:
                           html = f.read()
 
-                      chunk_urls_js = str(chunks)
-                      loader_js = (
-                          "async function __loadWasmChunks() {\n"
-                          f"  const parts = {chunk_urls_js};\n"
-                          "  const buffers = await Promise.all(parts.map(p => fetch(p).then(r => {\n"
-                          "    if (!r.ok) throw new Error('Chunk load failed: ' + p);\n"
-                          "    return r.arrayBuffer();\n"
-                          "  })));\n"
-                          "  const total = buffers.reduce((acc, b) => acc + b.byteLength, 0);\n"
-                          "  const out = new Uint8Array(total);\n"
-                          "  let offset = 0;\n"
-                          "  for (const b of buffers) {\n"
-                          "    out.set(new Uint8Array(b), offset);\n"
-                          "    offset += b.byteLength;\n"
-                          "  }\n"
-                          "  return out;\n"
-                          "}\n"
-                          "const wasm = await init({ module_or_path: await __loadWasmChunks() });"
-                      )
+                      # 核心修复：通过重写全局 fetch，当 Trunk 请求该 wasm 文件时，透明在内存组装返回 Response
+                      parts_json = str(chunks)
+                      transparent_loader = f"""
+<script>
+  (function() {{
+    const originalFetch = window.fetch;
+    const targetWasm = "{wasm_filename}";
+    const parts = {parts_json};
 
-                      html = re.sub(r'const wasm = await init\(\{[^}]+\}\);', loader_js, html)
-                      html = re.sub(r'<link rel="preload" [^>]*\.wasm[^>]*>', '', html)
+    window.fetch = async function(...args) {{
+      const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
+      if (url.includes(targetWasm)) {{
+        console.log('[ChunkLoader] 正在并发加载 Wasm 分片并还原...');
+        const basePath = url.substring(0, url.lastIndexOf('/') + 1);
+        const buffers = await Promise.all(parts.map(p => originalFetch(basePath + p).then(r => {{
+          if (!r.ok) throw new Error("加载分片失败: " + p);
+          return r.arrayBuffer();
+        }})));
+        const total = buffers.reduce((acc, b) => acc + b.byteLength, 0);
+        const merged = new Uint8Array(total);
+        let offset = 0;
+        for (const b of buffers) {{
+          merged.set(new Uint8Array(b), offset);
+          offset += b.byteLength;
+        }}
+        return new Response(merged, {{
+          headers: {{ 'Content-Type': 'application/wasm' }}
+        }});
+      }}
+      return originalFetch.apply(this, args);
+    }};
+  }})();
+</script>
+"""
+                      # 插入到 <head> 顶部，确保在任何 Trunk/Wasm 脚本运行前完成拦截
+                      if "<head>" in html:
+                          html = html.replace("<head>", "<head>\n" + transparent_loader)
+                      else:
+                          html = transparent_loader + html
 
                       with open(html_path, "w", encoding="utf-8") as f:
                           f.write(html)
-                      print(f"Updated {html_path} with chunk loader.")
+                      print(f"✅ 已向 {html_path} 注入透明分片网络还原器")
               else:
-                  print(f"Wasm size is safe (<= 24MB)")
+                  print(f"✅ {wasm_filename} 体积安全 (<= 24MB)，无需切片")
           PYEOF
 
           python3 split_wasm.py
