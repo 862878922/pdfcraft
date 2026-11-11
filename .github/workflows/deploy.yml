@@ -55,7 +55,6 @@ jobs:
       # 6. 配置体积压缩、关闭 Trunk 老旧 wasm-opt，并自动注入默认中文设置
       - name: Optimize Profile and Set Chinese Default
         run: |
-          # 禁用 Trunk 内置 wasm-opt 避免构建报错
           if [ -f "Trunk.toml" ]; then
             sed -i 's/wasm_opt = true/wasm_opt = false/g' Trunk.toml || true
             sed -i 's/wasm_opt = "z"/wasm_opt = false/g' Trunk.toml || true
@@ -64,7 +63,6 @@ jobs:
             sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' index.html || true
           fi
 
-          # 独立生成并执行优化与中文语言补丁脚本，彻底规避 YAML 解析器引号解析冲突
           cat << 'PYEOF' > patch_chinese_and_profile.py
           import os, re
 
@@ -119,3 +117,123 @@ jobs:
               with open("index.html", "r", encoding="utf-8") as f:
                   html = f.read()
               script = (
+                  "<script>\n"
+                  "try {\n"
+                  "  if (!localStorage.getItem('pdfcraft_language') && !localStorage.getItem('language')) {\n"
+                  "    localStorage.setItem('pdfcraft_language', 'zh');\n"
+                  "    localStorage.setItem('language', 'zh');\n"
+                  "    localStorage.setItem('locale', 'zh');\n"
+                  "  }\n"
+                  "} catch(e) {}\n"
+                  "</script>\n"
+              )
+              if "<head>" in html and "pdfcraft_language" not in html:
+                  html = html.replace("<head>", "<head>\n" + script)
+                  with open("index.html", "w", encoding="utf-8") as f:
+                      f.write(html)
+                  print("Injected Chinese default script into index.html")
+          PYEOF
+
+          python3 patch_chinese_and_profile.py
+          rm -f patch_chinese_and_profile.py
+
+      # 7. 构建 WebAssembly 产物
+      - name: Build Web Application
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: |
+          trunk build --release
+          echo "=== 检查初步构建产物 ==="
+          ls -lh dist/
+
+      # 8. 深度压缩 wasm 并执行 24MB 自动切片防御
+      - name: Compress Wasm & Handle 25MB Cloudflare Limit
+        run: |
+          WASM_FILE=$(ls dist/*_bg.wasm 2>/dev/null | head -n 1 || ls dist/*.wasm 2>/dev/null | head -n 1)
+          if [ -z "$WASM_FILE" ]; then
+            echo "❌ 未检测到编译出的 wasm 文件，检查 dist 目录内容："
+            ls -lh dist/
+            exit 1
+          fi
+
+          echo "压缩前大小: $(ls -lh "$WASM_FILE" | awk '{print $5}')"
+          wasm-opt --all-features -Oz --strip-debug --strip-producers "$WASM_FILE" -o "$WASM_FILE" || true
+          echo "压缩后大小: $(ls -lh "$WASM_FILE" | awk '{print $5}')"
+
+          cat << 'PYEOF' > split_wasm.py
+          import os, glob, re
+
+          wasm_files = glob.glob("dist/*.wasm")
+          if not wasm_files:
+              print("No wasm found")
+              exit(0)
+
+          wasm_path = wasm_files[0]
+          size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
+          print(f"Current wasm size: {size_mb:.2f} MB")
+
+          if size_mb > 24.0:
+              print("Wasm size exceeds 24MB, splitting chunks...")
+              wasm_filename = os.path.basename(wasm_path)
+              chunk_size = 15 * 1024 * 1024
+              with open(wasm_path, "rb") as f:
+                  data = f.read()
+
+              chunks = []
+              for i in range(0, len(data), chunk_size):
+                  part_name = f"{wasm_filename}.part{len(chunks)}"
+                  part_path = os.path.join("dist", part_name)
+                  with open(part_path, "wb") as pf:
+                      pf.write(data[i:i+chunk_size])
+                  chunks.append(f"./{part_name}")
+                  print(f"Generated part: {part_name}")
+
+              os.remove(wasm_path)
+
+              html_path = "dist/index.html"
+              with open(html_path, "r", encoding="utf-8") as f:
+                  html = f.read()
+
+              chunk_urls_js = str(chunks)
+              loader_js = (
+                  "async function __loadWasmChunks() {\n"
+                  f"  const parts = {chunk_urls_js};\n"
+                  "  const buffers = await Promise.all(parts.map(p => fetch(p).then(r => {\n"
+                  "    if (!r.ok) throw new Error('Chunk load failed: ' + p);\n"
+                  "    return r.arrayBuffer();\n"
+                  "  })));\n"
+                  "  const total = buffers.reduce((acc, b) => acc + b.byteLength, 0);\n"
+                  "  const out = new Uint8Array(total);\n"
+                  "  let offset = 0;\n"
+                  "  for (const b of buffers) {\n"
+                  "    out.set(new Uint8Array(b), offset);\n"
+                  "    offset += b.byteLength;\n"
+                  "  }\n"
+                  "  return out;\n"
+                  "}\n"
+                  "const wasm = await init({ module_or_path: await __loadWasmChunks() });"
+              )
+
+              html = re.sub(r'const wasm = await init\(\{[^}]+\}\);', loader_js, html)
+              html = re.sub(r'<link rel="preload" [^>]*\.wasm[^>]*>', '', html)
+
+              with open(html_path, "w", encoding="utf-8") as f:
+                  f.write(html)
+              print("Updated dist/index.html with chunk loader.")
+          else:
+              print("Wasm file size within safe limit (<= 24MB).")
+          PYEOF
+
+          python3 split_wasm.py
+          rm -f split_wasm.py
+
+          echo "=== 最终提交部署的文件列表 ==="
+          ls -lh dist/
+
+      # 9. 部署发布到 Cloudflare Pages (使用官方 Wrangler Action 并强制校验输出)
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=lotelf-pdf --branch=main --commit-dirty=true
