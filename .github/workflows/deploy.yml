@@ -66,7 +66,7 @@ jobs:
           cat << 'PYEOF' > patch_all.py
           import os, re
 
-          # 1. 注入 Fat LTO 与 codegen-units=1 极致体积配置，直压进入 20MB 安全线
+          # 1. 注入 Fat LTO 与 codegen-units=1 极致体积配置
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
@@ -178,12 +178,12 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并通过透明 Fetch 拦截器处理分片（彻底解决黑屏加载问题）
+      # 8. 深度压缩 wasm 并通过纯原生 Fetch 还原分片（无语法冲突）
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
           cat << 'PYEOF' > split_wasm.py
-          import os, glob, re, subprocess
+          import os, glob, subprocess, json
 
           wasm_files = glob.glob("dist/web/**/*.wasm", recursive=True)
           if not wasm_files:
@@ -198,7 +198,7 @@ jobs:
               wasm_filename = os.path.basename(wasm_path)
               print(f"\n--- Processing: {wasm_filename} ---")
               
-              # 1. 深度优化瘦身（带 --all-features 与 -Oz 极致压榨）
+              # 1. 深度优化瘦身
               cmd = [
                   "/usr/local/bin/wasm-opt-raw",
                   "--all-features",
@@ -217,10 +217,10 @@ jobs:
               except Exception as e:
                   print(f"wasm-opt error: {e}")
 
-              # 2. 检查体积，如果依然大于 24MB，则采用透明 Fetch 劫持合并（不改动 Trunk 任何 JS 执行逻辑）
+              # 2. 检查体积，如果依然大于 24MB，则分片并通过 Fetch 拦截透明合并
               size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
               if size_mb > 24.0:
-                  print(f"⚠️ {wasm_filename} 体积大于 24MB ({size_mb:.2f} MB)，启动无损透明分片...")
+                  print(f"Wasm size exceeds 24MB ({size_mb:.2f} MB), splitting chunks...")
                   chunk_size = 15 * 1024 * 1024
                   with open(wasm_path, "rb") as f:
                       data = f.read()
@@ -232,9 +232,8 @@ jobs:
                       with open(part_path, "wb") as pf:
                           pf.write(data[i:i+chunk_size])
                       chunks.append(part_name)
-                      print(f"  已生成分片: {part_name}")
+                      print(f"  Generated part: {part_name}")
 
-                  # 移除超出大小的原始文件
                   os.remove(wasm_path)
 
                   html_path = os.path.join(wasm_dir, "index.html")
@@ -242,51 +241,53 @@ jobs:
                       with open(html_path, "r", encoding="utf-8") as f:
                           html = f.read()
 
-                      # 核心修复：通过重写全局 fetch，当 Trunk 请求该 wasm 文件时，透明在内存组装返回 Response
-                      parts_json = str(chunks)
-                      transparent_loader = f"""
-<script>
-  (function() {{
-    const originalFetch = window.fetch;
-    const targetWasm = "{wasm_filename}";
-    const parts = {parts_json};
+                      parts_json_str = json.dumps(chunks)
+                      
+                      # 构造纯净 JS 拦截器字符串
+                      js_lines = [
+                          "<script>",
+                          "(function() {",
+                          "  var origFetch = window.fetch;",
+                          '  var targetWasm = "' + wasm_filename + '";',
+                          "  var parts = " + parts_json_str + ";",
+                          "  window.fetch = async function() {",
+                          "    var args = Array.prototype.slice.call(arguments);",
+                          "    var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');",
+                          "    if (url.indexOf(targetWasm) !== -1) {",
+                          "      console.log('[ChunkLoader] Fetching and merging wasm parts...');",
+                          "      var basePath = url.substring(0, url.lastIndexOf('/') + 1);",
+                          "      var buffers = await Promise.all(parts.map(function(p) {",
+                          "        return origFetch(basePath + p).then(function(r) {",
+                          "          if (!r.ok) throw new Error('Part failed: ' + p);",
+                          "          return r.arrayBuffer();",
+                          "        });",
+                          "      }));",
+                          "      var total = buffers.reduce(function(acc, b) { return acc + b.byteLength; }, 0);",
+                          "      var merged = new Uint8Array(total);",
+                          "      var offset = 0;",
+                          "      for (var i = 0; i < buffers.length; i++) {",
+                          "        merged.set(new Uint8Array(buffers[i]), offset);",
+                          "        offset += buffers[i].byteLength;",
+                          "      }",
+                          "      return new Response(merged, { headers: { 'Content-Type': 'application/wasm' } });",
+                          "    }",
+                          "    return origFetch.apply(this, args);",
+                          "  };",
+                          "})();",
+                          "</script>"
+                      ]
+                      transparent_loader = "\n".join(js_lines)
 
-    window.fetch = async function(...args) {{
-      const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
-      if (url.includes(targetWasm)) {{
-        console.log('[ChunkLoader] 正在并发加载 Wasm 分片并还原...');
-        const basePath = url.substring(0, url.lastIndexOf('/') + 1);
-        const buffers = await Promise.all(parts.map(p => originalFetch(basePath + p).then(r => {{
-          if (!r.ok) throw new Error("加载分片失败: " + p);
-          return r.arrayBuffer();
-        }})));
-        const total = buffers.reduce((acc, b) => acc + b.byteLength, 0);
-        const merged = new Uint8Array(total);
-        let offset = 0;
-        for (const b of buffers) {{
-          merged.set(new Uint8Array(b), offset);
-          offset += b.byteLength;
-        }}
-        return new Response(merged, {{
-          headers: {{ 'Content-Type': 'application/wasm' }}
-        }});
-      }}
-      return originalFetch.apply(this, args);
-    }};
-  }})();
-</script>
-"""
-                      # 插入到 <head> 顶部，确保在任何 Trunk/Wasm 脚本运行前完成拦截
                       if "<head>" in html:
                           html = html.replace("<head>", "<head>\n" + transparent_loader)
                       else:
-                          html = transparent_loader + html
+                          html = transparent_loader + "\n" + html
 
                       with open(html_path, "w", encoding="utf-8") as f:
                           f.write(html)
-                      print(f"✅ 已向 {html_path} 注入透明分片网络还原器")
+                      print(f"Transparent chunk loader injected into {html_path}")
               else:
-                  print(f"✅ {wasm_filename} 体积安全 (<= 24MB)，无需切片")
+                  print(f"Wasm size safe (<= 24MB), no splitting needed.")
           PYEOF
 
           python3 split_wasm.py
