@@ -39,7 +39,7 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      # 4. 安装兼容版 Trunk (锁定 v0.20.3，避免 v0.22 的 workspace 破坏性变更)
+      # 4. 安装兼容版 Trunk
       - name: Install Trunk
         uses: taiki-e/install-action@v2
         with:
@@ -52,35 +52,18 @@ jobs:
           sudo cp binaryen-version_122/bin/* /usr/local/bin/
           wasm-opt --version
 
-      # 6. 配置体积压缩、修复 Trunk 目标 crate 映射并设置默认中文
+      # 6. 配置体积压缩、查找所有 index.html 注入默认中文
       - name: Optimize Profile and Set Chinese Default
         run: |
-          # 禁用 Trunk 内置 wasm-opt，避免多重调用
-          if [ -f "Trunk.toml" ]; then
-            sed -i 's/wasm_opt = true/wasm_opt = false/g' Trunk.toml || true
-            sed -i 's/wasm_opt = "z"/wasm_opt = false/g' Trunk.toml || true
-          fi
-          if [ -f "index.html" ]; then
-            sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' index.html || true
-          fi
+          # 禁用所有可能的 Trunk 内置 wasm-opt 配置
+          find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
+          find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
+          find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
 
           cat << 'PYEOF' > patch_all.py
           import os, re
 
-          # 1. 修复 index.html 中 trunk 的 crate 声明 (解决 could not find the root package 报错)
-          for html_file in ["index.html", "crates/pdfcraft/index.html"]:
-              if os.path.exists(html_file):
-                  with open(html_file, "r", encoding="utf-8") as f:
-                      html_content = f.read()
-                  
-                  # 显式声明 data-package="pdfcraft"
-                  if 'data-trunk rel="rust"' in html_content and 'data-package' not in html_content:
-                      html_content = html_content.replace('data-trunk rel="rust"', 'data-trunk rel="rust" data-package="pdfcraft"')
-                      with open(html_file, "w", encoding="utf-8") as f:
-                          f.write(html_content)
-                      print(f"✅ 已在 {html_file} 中注入 data-package='pdfcraft'")
-
-          # 2. 安全追加/替换 release profile，保证不损坏 workspace 配置
+          # 1. 安全追加/替换 release profile
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
@@ -112,7 +95,7 @@ jobs:
                   f.writelines(filtered)
               print("✅ Cargo.toml 优化配置更新完成")
 
-          # 3. 扫描源码并将默认语言修改为中文
+          # 2. 扫描源码并将默认语言修改为中文
           for root, _, files in os.walk("crates"):
               for file in files:
                   if file.endswith(".rs"):
@@ -135,38 +118,65 @@ jobs:
                       except Exception:
                           pass
 
-          # 4. 前端 index.html 注入默认中文 localStorage
-          if os.path.exists("index.html"):
-              with open("index.html", "r", encoding="utf-8") as f:
-                  html = f.read()
-              script = (
-                  "<script>\n"
-                  "try {\n"
-                  "  if (!localStorage.getItem('pdfcraft_language') && !localStorage.getItem('language')) {\n"
-                  "    localStorage.setItem('pdfcraft_language', 'zh');\n"
-                  "    localStorage.setItem('language', 'zh');\n"
-                  "    localStorage.setItem('locale', 'zh');\n"
-                  "  }\n"
-                  "} catch(e) {}\n"
-                  "</script>\n"
-              )
-              if "<head>" in html and "pdfcraft_language" not in html:
-                  html = html.replace("<head>", "<head>\n" + script)
-                  with open("index.html", "w", encoding="utf-8") as f:
-                      f.write(html)
-                  print("✅ index.html 注入默认中文存储成功")
+          # 3. 为所有检索到的 index.html 注入默认中文 localStorage
+          for root, _, files in os.walk("."):
+              for file in files:
+                  if file == "index.html" and "dist" not in root and "target" not in root:
+                      path = os.path.join(root, file)
+                      with open(path, "r", encoding="utf-8") as f:
+                          html = f.read()
+                      script = (
+                          "<script>\n"
+                          "try {\n"
+                          "  if (!localStorage.getItem('pdfcraft_language') && !localStorage.getItem('language')) {\n"
+                          "    localStorage.setItem('pdfcraft_language', 'zh');\n"
+                          "    localStorage.setItem('language', 'zh');\n"
+                          "    localStorage.setItem('locale', 'zh');\n"
+                          "  }\n"
+                          "} catch(e) {}\n"
+                          "</script>\n"
+                      )
+                      if "<head>" in html and "pdfcraft_language" not in html:
+                          html = html.replace("<head>", "<head>\n" + script)
+                          with open(path, "w", encoding="utf-8") as f:
+                              f.write(html)
+                          print(f"✅ 已在 {path} 注入中文初始化脚本")
           PYEOF
 
           python3 patch_all.py
           rm -f patch_all.py
 
-      # 7. 构建 WebAssembly 产物
+      # 7. 动态定位 index.html 真实路径并构建 WebAssembly 产物
       - name: Build Web Application
         env:
           CARGO_BUILD_JOBS: 2
         run: |
-          trunk build --release
-          echo "=== 检查构建产物 ==="
+          echo "=== 正在全局搜索 index.html ==="
+          HTML_PATH=$(find . -maxdepth 4 -name "index.html" ! -path "*/target/*" ! -path "*/dist/*" | head -n 1)
+          
+          if [ -z "$HTML_PATH" ]; then
+            echo "❌ 未能找到 index.html，输出当前目录结构："
+            ls -la
+            exit 1
+          fi
+
+          echo "✅ 找到有效入口 HTML 文件: $HTML_PATH"
+          HTML_DIR=$(dirname "$HTML_PATH")
+          
+          # 进入包含 index.html 的目录进行编译构建
+          cd "$HTML_DIR"
+          trunk build index.html --release
+          cd -
+
+          # 收集产物到根目录 dist/
+          if [ ! -d "dist" ]; then
+            PROD_DIST=$(find . -maxdepth 4 -type d -name "dist" ! -path "*/target/*" | head -n 1)
+            if [ -n "$PROD_DIST" ] && [ "$PROD_DIST" != "./dist" ]; then
+              cp -r "$PROD_DIST" ./dist
+            fi
+          fi
+
+          echo "=== 检查最终构建产物 ==="
           ls -lh dist/
 
       # 8. 深度压缩 wasm 并执行 24MB 自动切片防御
